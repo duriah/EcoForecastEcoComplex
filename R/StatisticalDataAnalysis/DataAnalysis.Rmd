@@ -1,0 +1,4347 @@
+---
+title: "Data analysis for 'Forecasting in the face of ecological complexity: number and strength of species interactions determine forecast skill in ecological communities'"
+
+author: "Daugaard et al. (2022)"
+date: "`r Sys.Date()`"
+output:
+  html_document:
+    number_sections: true
+    code_folding: hide
+    toc: true
+    toc_float: true
+    toc_collapsed: true
+    toc_depth: 3
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+Note that several code chunks have the option "Eval=FALSE" which means that they are not run. This is because they take too long (the complete forecasting takes, days, up to weeks). Instead, the related results are loaded in later in the code (often in the subsequent code chunk). The data is saved in the folder "Data".
+
+
+# Dependencies, functions and data
+
+## Dependencies
+
+```{r dependencies, include=FALSE}
+library(readr)
+library(tidyverse)
+library(patchwork)
+library(pracma)
+library(data.table)
+library(rEDM)
+library(foreach)
+library(parallel)
+library(doParallel) 
+library(kableExtra)
+library(lme4)
+library(lmerTest)
+library(merTools)
+library(ggfortify)
+library(ggpubr)
+library(ggtext)
+library(RColorBrewer)
+library(grid)
+library(MARSS)
+library(here)
+library(elasticnet)
+library(forecast)
+library(caret)
+library(tensorflow)
+library(keras)
+library(emmeans)
+library(rsq)
+
+options(dplyr.summarise.inform=F)
+```
+
+## Functions
+
+```{r standard_theme, message=FALSE, warning=FALSE, }
+# Standard theme function
+
+standard_theme <- function(){ 
+    theme_bw() %+replace%   
+    theme(
+      legend.position = "none",
+      axis.title = element_text(size=13),
+      axis.text = element_text(size=10),
+      legend.text = element_text(size=11),
+      strip.text = element_text(size=11, hjust = 0, vjust = 1),
+      strip.background = element_blank(),
+      panel.grid.major = element_blank(),
+      panel.grid.minor = element_blank(),
+    )
+}
+
+standard_theme2 <- function(){ 
+    theme_bw() %+replace%   
+    theme(
+      legend.position = "none",
+      axis.title = element_text(size=13),
+      axis.text = element_text(size=10),
+      legend.text = element_text(size=11),
+      panel.grid.major = element_blank(),
+      panel.grid.minor = element_blank(),
+    )
+}
+```
+
+```{r load_own_fcts, }
+source(file = here("R/Functions/pe_code.R")) 
+source(file = here("R/Functions/rq1_multiview_functions.R"))
+source(file = here("R/Functions/rq2_smap_functions.R"))
+source(file = here("R/Functions/other_functions.R"))
+source(file = here("R/Functions/number_of_interaction_functions.R"))
+```
+
+
+## Data loading and data processing
+
+```{r load_data_and_processing, message=FALSE, warning=FALSE, }
+##############################################################
+## Load data
+
+dd <- read_csv(here("Data/Final_dataset_all_sources/complete_dataset.csv"), col_types = cols(X1 = col_skip())) 
+taxa <- read_csv(here("Data/Final_dataset_all_sources/taxa_table.csv"))
+
+dd <- dd[with(dd, order(variable, ID, day)),]
+
+tag <- c("A","B","C","D","E","F","G","H","I","J","K","L","M","N")
+label <- c(bacteria="Bacteria", chlamydomonas_reinhardtii="*Chlamydomonas reinhardtii*", 
+					 colpidium_striatum="*Colpidium striatum*", dexiostomata_campylum="*Dexiostoma campylum*",
+					 didinium_nasutum="*Didinium nasutum*", euglena_gracilis="*Euglena gracilis*", 
+					 euplotes_daidaleos="*Euplotes daidaleos*", paramecium_caudatum="*Paramecium caudatum*",
+					 rotifer_sp="*Rotifer* sp.", big_white_particle="Big and white flagellates",
+					 small_white_particle="Small and white flagellates", 
+					 green_white_particle="Green and white flagellates", temperature="Temperature",
+					 dissolved_oxygen="Dissolved oxygen",spirostomum_sp="*Spirostomum* sp.")
+
+##############################################################
+## Interpolation
+
+dd2 <- dd %>%
+  dplyr::filter(variable %in% c("bacteria", "big_white_particle", "chlamydomonas_reinhardtii",
+                         "colpidium_striatum", "dexiostomata_campylum", 
+                         "didinium_nasutum", "dissolved_oxygen", "euglena_gracilis", 
+                         "euplotes_daidaleos", "green_white_particle", 
+                         "paramecium_caudatum", "rotifer_sp", "small_white_particle",
+                         "spirostomum_sp", "temperature"))
+
+nr.timepoints <- length(unique(dd2$day)) 
+
+time.interp <- seq(min(dd2$day), max(dd2$day), length.out = nr.timepoints)
+
+chi <- function(x,y){
+  return(interp1(x, y, xi=time.interp, method="cubic")) 
+}
+
+dd2 <- setDT(dd2)[, list(day = time.interp,
+                         response = chi(day, response),
+                         date=date,
+                         treat=treat,
+                         treat2=treat2,
+                         treat3=treat3,
+                         incubator=incubator),
+                  by = .(variable, ID)]
+
+dd2$response <- ifelse(dd2$variable=="temperature" & dd2$treat=="const", 17.3, dd2$response)
+
+
+##############################################################
+## Coefficient of variation
+
+targets <- c("bacteria","chlamydomonas_reinhardtii","colpidium_striatum",
+             "dexiostomata_campylum","euglena_gracilis","euplotes_daidaleos",
+             "paramecium_caudatum","rotifer_sp")
+
+cv <- dd2 %>%
+  dplyr::filter(variable %in% targets) %>%
+  group_by(ID, variable) %>%
+  summarize(cv = sd(response)/mean(response),
+            sd = sd(response),
+            mean = mean(response)) %>%
+	rename(Target=variable)
+
+##############################################################
+## fourth root transformation
+ 
+dd2$response <- (dd2$response)^(1/4)
+
+##############################################################
+## remove linear trend
+
+dd2 <- setDT(dd2)[, list(day = day,
+                         response = residuals(lm(response~day)),
+                         date=date,
+                         treat=treat,
+                         treat2=treat2,
+                         treat3=treat3,
+                         incubator=incubator),
+                  by = .(variable, ID)]
+
+dd2 <- dd2 %>% na.omit()
+
+##############################################################
+## Standardization
+
+dd2 <- dd2 %>%
+  dplyr::filter(variable!="spirostomum_sp")%>%
+  group_by(variable, ID, treat, treat2, treat3, incubator) %>%
+  mutate(response = (response-mean(response, na.rm=T))/sd(response, na.rm = T))
+
+dd2$response <-	ifelse(dd2$variable=="temperature" & dd2$treat=="const", 0, dd2$response)
+
+##############################################################
+## Calculation of permutation entropies
+
+permutation_entropies <- dd2 %>% group_by(ID,variable,treat,treat2,treat3) %>%
+  dplyr::filter(variable %in% targets) %>%
+  summarize(PE = PE(x = response, weighted = T, word_length = 5, tau = 1,
+                                tie_method = "noise", noise_amount = 10)) %>%
+	rename(Target=variable)
+ 
+##############################################################
+## Wide format data
+dd2_long <- dd2
+dd2 <- dd2 %>%
+  pivot_wider(names_from = variable,
+              values_from = response)
+
+rm(time.interp)
+```
+
+
+# Estimations and forecastings (main text)
+
+## Species abudance forecasting
+
+The following chunk is not run as it takes a long time to run (1-2 weeks). Instead the results are loaded in in the chunk afterwards.
+
+```{r multiview_forecast_analysis, message=FALSE, warning=FALSE, cache=TRUE, eval=FALSE}
+##############################################################
+## Species forecasting 
+
+# First some preparation:
+ks <- unique(round(exp(seq(log(0.8),log(100.4),length.out = 33))))
+
+possible_predictors <- c("bacteria","chlamydomonas_reinhardtii","colpidium_striatum",
+                         "dexiostomata_campylum", "didinium_nasutum",
+                         "euglena_gracilis","euplotes_daidaleos","paramecium_caudatum",
+                         "rotifer_sp","big_white_particle","dissolved_oxygen",
+                         "green_white_particle", "small_white_particle")
+ 
+dd2 <- dd2 %>% ungroup()
+set.seed(54)
+which=c(1,2,3,4,6,8,10,13)
+predictor_combinations <- predictor_combinator(possible_predictors, which=which)
+
+ddrq1_list <- lapply(targets, function(target){
+  df1 <- model_fitter_wrapper(whole.data = dd2, 
+                              predictor_combinations =  predictor_combinations,
+                              target = target,
+                              num.clusters = detectCores() - 1, 
+                              E = 3, max_lag = 3, k=ks)
+})
+
+ddrq1 <- do.call("rbind", ddrq1_list)
+
+predictors <- c(possible_predictors,"temperature")
+ddrq1$predictor_combination <- as.character(ddrq1$predictor_combination)
+temp <- matrix(F, nrow = nrow(ddrq1), ncol = length(predictors))
+colnames(temp) <- predictors
+ddrq1 <- cbind(ddrq1,temp)
+
+ddrq1 <- as.data.frame(t(apply(ddrq1, 1, function(row) { 
+  str <- unlist(strsplit(row["predictor_combination"], " "))
+  row[str] <- T
+  row
+})))
+
+ddrq1$num_pred <- as.numeric(ddrq1$num_pred)
+ddrq1$num_pred_without_temp <- as.numeric(ddrq1$num_pred_without_temp)
+ddrq1$RMSE <- as.numeric(ddrq1$RMSE)
+ddrq1$k <- as.numeric(ddrq1$k)
+for(i in predictors){  ddrq1[,i] <- as.logical(ddrq1[,i])}
+
+save(ddrq1, file = here("Data/Multiview_forecast_data/ddrq1_transf_resid_which_all.RData"))
+```
+
+
+```{r multiview_forecast_load, message=FALSE, warning=FALSE, cache=TRUE, }
+ks <- unique(round(exp(seq(log(0.8),log(100.4),length.out = 33))))
+load(here("Data/Multiview_forecast_data/ddrq1_transf_resid_which_all.RData"))  # done previously
+ddrq1 <- ddrq1 %>% na.omit()
+ddrq1_summarized <- ddrq1 %>%
+  dplyr::group_by(Target, ID, num_pred, temperature_included, treat, treat2, treat3) %>%
+  dplyr::summarise(median_rmse = median(RMSE),
+                   mean_rmse = mean(RMSE),
+                   min_rmse = min(RMSE))
+```
+
+### Number of models fitted
+
+```{r model_table_calc, cache=TRUE, message=FALSE}
+ks <- unique(round(exp(seq(log(0.8),log(100.4),length.out = 33))))
+model.table <- data.frame(number_of_predictors=c(1,2,3,4,6,8,10,13))
+model.table$choose_n_from_13 <- choose(13,model.table$number_of_predictors)
+model.table$number_of_predictor_combos <- ifelse(model.table$choose_n_from_13>200,200,model.table$choose_n_from_13)
+model.table$number_of_lagged_predictors_for_n_predictors <- choose(3*model.table$number_of_predictors,3)
+model.table$number_of_different_k_values <- sapply(model.table$number_of_lagged_predictors_for_n_predictors, 
+                                                   function(x){sum(ks<=x)})
+model.table$number_of_predictor_combos_TIMES_number_of_different_k_values <- 
+  model.table$number_of_predictor_combos*model.table$number_of_different_k_values
+num_of_models <- sum(model.table$number_of_predictor_combos_TIMES_number_of_different_k_values)*8*18 
+```
+
+
+
+## Calculation of the number of interactions
+
+The following code chunk is not run. Its results are loaded in in the chunk following it.
+
+```{r determine_numb_interactions, message=FALSE, warning=FALSE, cache=TRUE, eval=FALSE}
+##############################################################
+## Number of interactions
+interactors <- colnames(dd2[,-c(1:7)])
+var_pairs <- expand.grid(target=targets, interactors=interactors)
+
+dd2_dflist <- split(dd2, dd2$ID)
+
+pairwise_ccm_df_list <- mclapply(dd2_dflist, function(df){
+	dftemp <- df[,-c(1,3:7)]
+	Best_E_df <- apply(var_pairs,1, function(c){
+		best_E_fct(dftemp,c[1],c[2])
+	})
+	
+	Best_E_df <- do.call("rbind",Best_E_df)
+	Best_E_df$ID <- unique(df$ID)
+	Best_E_df$treat <- unique(df$treat)
+	Best_E_df$treat2 <- unique(df$treat2)
+	Best_E_df$treat3 <- unique(df$treat3)
+	
+	rhos <- apply(Best_E_df, 1, function(r){
+		ccm_out <- CCM(dataFrame = dftemp, target = r[1], column = r[2],
+									 libSizes = "10 60 10", Tp = 0, E = as.numeric(r[3]), sample = 100)
+		rho <- ccm_out[6,3]
+		if(rho<0) return(data.frame(rho=rho,comment="negative"))
+		slope <- lm(ccm_out[,3] ~ seq(10,60,by = 10))$coefficients[2]
+		if(slope>=0) {return(data.frame(rho=rho,comment="converged"))
+		} else {return(data.frame(rho=rho,comment="not converged"))}
+	})
+	
+	Best_E_df <- cbind(Best_E_df,do.call("rbind",rhos))
+	
+	rho_df <- Best_E_df %>%
+		dplyr::filter(target %in% targets, comment=="converged")
+	
+	significances <- apply(rho_df, 1, function(r){
+		ts <- unlist(df[,as.character(r[2])])
+		# target <- r[2]
+		surr_interactor = SurrogateData(ts, method = "random_shuffle",
+																		num_surr = 1000, alpha = 3)
+		
+		rho_surr <- data.frame(interactor_rho = numeric(1000))
+		
+		interactor_data = as.data.frame(cbind(df$day, ts, surr_interactor))
+		names(interactor_data) = c("day", r[1], paste("T", as.character(seq(1, 1000)),	sep = ""))
+		
+		for (i in 1:1000) {
+			targetCol = paste("T", i, sep = "") 
+			ccm_out = CCM(dataFrame = interactor_data, E = as.numeric(r[3]), Tp = 0, columns = r[1],
+										target = targetCol, libSizes = "60 60 10", sample = 1)
+			col = paste(r[1], ":", targetCol, sep = "")
+			rho_surr$interactor_rho[i] = ccm_out[1, col]
+		}
+		1 - ecdf(rho_surr$interactor_rho)(as.numeric(r["rho"]))
+	})
+	
+	rho_df$significances <- significances
+	pairwise_ccm_df <- full_join(Best_E_df,rho_df)
+	pairwise_ccm_df
+}, mc.cores = detectCores()-2)
+
+save(pairwise_ccm_df_list, file = here("Data/CCM_analysis_data/pairwise_ccm_df_list_transf_resid.RData"))
+```
+
+
+## Estimations of interactions
+
+```{r estimate_interactions, message=FALSE, warning=FALSE, cache=TRUE}
+##############################################################
+## Species interactions
+
+# Load number of interactions
+load(here("Data/CCM_analysis_data/pairwise_ccm_df_list_transf_resid.RData")) 
+pairwise_ccm_df <- do.call("rbind",pairwise_ccm_df_list)
+
+significant_pairwise_ccm_df <- pairwise_ccm_df %>%
+	dplyr::filter(significances<0.05, rho >0)
+
+# calculation of interactions 
+list_smap <- lapply(targets, function(x){
+  SMapInteractions(Target = x, num.clusters.target = 1, 
+                   num.clusters.CV = NULL, method = "SMap", 
+                   data = dd2, long_format = T, theta = 5, 
+                   ccm_df = significant_pairwise_ccm_df)
+})
+
+dd_smap <- do.call("rbind", list_smap) %>%
+  dplyr::filter(!(treat=="const" & interactor=="temperature"),
+                Interaction!="C0")
+
+significant_pairwise_ccm_df$Target2 <- label[significant_pairwise_ccm_df$target]
+
+# Figure for number of interactions
+num_int_plot <- significant_pairwise_ccm_df %>%
+	na.omit() %>% 
+	ggplot(aes(ID, fill=Target2)) +
+	geom_bar(position = "identity")+
+	facet_wrap(~Target2, ncol = 4)+
+	standard_theme2() +
+	scale_fill_brewer(palette="Dark2")+
+	labs(x="Bottle ID", y="Number of interactions") +
+	theme(strip.text = ggtext::element_markdown(),
+				axis.text.x = element_text(angle = 90, vjust = 0.5, hjust=1))
+
+rm(list_smap, pairwise_ccm_df_list)
+```
+
+# Regressions
+
+## Relation between number of interactors, mean interaction strength and RMSE
+
+```{r rq1_functions, message=FALSE, warning=FALSE, cache=TRUE}
+# the following functions are needed because of the robustness analysis in the supplementary
+
+rq1_model_fcts <- function(ddrq1_treat_14, iso=T, corr=T, count=T, mean_mean_abs=T, table=T){
+
+	newdat <- F
+	if(iso){
+		m.iso <- lmer(RMSE~sum_mean_abs*treat + (1|ID), data = ddrq1_treat_14)
+		newdat.iso <- expand.grid(sum_mean_abs = seq(min(ddrq1_treat_14$sum_mean_abs),
+																								 max(ddrq1_treat_14$sum_mean_abs),length.out = 200),
+															treat = unique(ddrq1_treat_14$treat))		
+		newdat.iso$RMSE <- predict(m.iso, newdat.iso, re.form=NA)
+		mm.iso <- model.matrix(terms(m.iso),newdat.iso)
+		pvar1.iso <- diag(mm.iso %*% tcrossprod(vcov(m.iso),mm.iso))
+		newdat.iso <- data.frame(newdat.iso,
+														 lower.iso=newdat.iso$RMSE-cmult*sqrt(pvar1.iso),
+														 upper.iso=newdat.iso$RMSE+cmult*sqrt(pvar1.iso))
+		newdat.iso$model <- "iso"
+		
+		if(newdat==F){
+			newdat <- newdat.iso
+		} else {
+			newdat <- full_join(newdat,newdat.iso)
+		}
+	}
+	
+	if(count){
+		m.count <- lmer(RMSE~count*treat + (1|ID), data = ddrq1_treat_14)
+		newdat.count <- expand.grid(count = seq(min(ddrq1_treat_14$count),
+																						max(ddrq1_treat_14$count),length.out = 200),
+																treat = unique(ddrq1_treat_14$treat))
+		newdat.count$RMSE <- predict(m.count, newdat.count, re.form=NA)
+		mm.count <- model.matrix(terms(m.count),newdat.count)
+		pvar1.count <- diag(mm.count %*% tcrossprod(vcov(m.count),mm.count))
+		newdat.count <- data.frame(newdat.count,
+															 lower.count=newdat.count$RMSE-cmult*sqrt(pvar1.count),
+															 upper.count=newdat.count$RMSE+cmult*sqrt(pvar1.count))
+		newdat.count$model <- "count"
+		if(newdat==F){
+			newdat <- newdat.count
+		} else {
+			newdat <- full_join(newdat,newdat.count)
+		}	
+	}	
+	
+	if(mean_mean_abs){
+		m.mean_mean_abs <- lmer(RMSE~mean_mean_abs*treat + (1|ID), data = ddrq1_treat_14)
+		newdat.mean_mean_abs <- expand.grid(mean_mean_abs = seq(min(ddrq1_treat_14$mean_mean_abs),
+																														max(ddrq1_treat_14$mean_mean_abs),length.out = 200),
+																				treat = unique(ddrq1_treat_14$treat))
+		newdat.mean_mean_abs$RMSE <- predict(m.mean_mean_abs, newdat.mean_mean_abs, re.form=NA)
+		mm.mean_mean_abs <- model.matrix(terms(m.mean_mean_abs),newdat.mean_mean_abs)
+		pvar1.mean_mean_abs <- diag(mm.mean_mean_abs %*% tcrossprod(vcov(m.mean_mean_abs),mm.mean_mean_abs))
+		newdat.mean_mean_abs <- data.frame(newdat.mean_mean_abs, 
+																			 lower.mean_mean_abs=newdat.mean_mean_abs$RMSE-cmult*sqrt(pvar1.mean_mean_abs),
+																			 upper.mean_mean_abs=newdat.mean_mean_abs$RMSE+cmult*sqrt(pvar1.mean_mean_abs))
+		newdat.mean_mean_abs$model <- "mean_mean_abs" 
+		if(newdat==F){
+			newdat <- newdat.mean_mean_abs
+		} else {
+			newdat <- full_join(newdat,newdat.mean_mean_abs)
+		}	
+	}
+
+	if(corr){
+		m.corr <- lmer(mean_mean_abs~count*treat + (1|ID), data = ddrq1_treat_14)
+		newdat.corr <- expand.grid(count = seq(min(ddrq1_treat_14$count),
+																					 max(ddrq1_treat_14$count),length.out = 200),
+															 treat = unique(ddrq1_treat_14$treat))
+		newdat.corr$mean_mean_abs <- predict(m.corr, newdat.corr, re.form=NA)
+		mm.corr <- model.matrix(terms(m.corr),newdat.corr)
+		pvar1.corr <- diag(mm.corr %*% tcrossprod(vcov(m.corr),mm.corr))
+		newdat.mean_mean_abs <- data.frame(newdat.mean_mean_abs, 
+																			 lower.mean_mean_abs=newdat.mean_mean_abs$RMSE-cmult*sqrt(pvar1.mean_mean_abs),
+																			 upper.mean_mean_abs=newdat.mean_mean_abs$RMSE+cmult*sqrt(pvar1.mean_mean_abs))
+		newdat.corr <- data.frame(newdat.corr, 
+															lower.corr=newdat.corr$mean_mean_abs-cmult*sqrt(pvar1.corr),
+															upper.corr=newdat.corr$mean_mean_abs+cmult*sqrt(pvar1.corr))
+		newdat.corr$model <-  "corr"
+		if(newdat==F){
+			newdat <- newdat.corr
+		} else {
+			newdat <- full_join(newdat,newdat.corr)
+		}	
+	}	
+	
+	newdat$treat <- ifelse(newdat$treat %in% c("const","Constant"),"Constant","Fluctuating")
+
+	if(table){
+		# tab
+		Covariates <- c("Fluctuating temperature","Interaction","Bottle ID")
+		tab <- data.frame(Response = rep(c("RMSE\n ","RMSE","Mean\ninteraction\nstrength","RMSE"), each=5),
+											Covariate = c("Intercept","Number of interactions",Covariates,
+																		"Intercept","Mean interaction strength",Covariates,
+																		"Intercept","Number of interactions",Covariates,
+																		"Intercept","Sum of interaction stengths", Covariates),
+											Type = rep(c("Fixed","Fixed","Fixed","Fixed","Std. Dev."), 4),
+											Coefficient = c(fixef(m.count),as.data.frame(VarCorr(m.count))$sdcor[1],
+																			fixef(m.mean_mean_abs),as.data.frame(VarCorr(m.mean_mean_abs))$sdcor[1],
+																			fixef(m.corr),as.data.frame(VarCorr(m.corr))$sdcor[1],
+																			fixef(m.iso),as.data.frame(VarCorr(m.iso))$sdcor[1]),
+											Std.err = c(summary(m.count)$coef[, 2, drop = FALSE],NA,
+																	summary(m.mean_mean_abs)$coef[, 2, drop = FALSE],NA,
+																	summary(m.corr)$coef[, 2, drop = FALSE],NA,
+																	summary(m.iso)$coef[, 2, drop = FALSE],NA),
+											Test = c(rep("\\textit{t}",4),"$\\chi^2$",
+															 rep("\\textit{t}",4),"$\\chi^2$",
+															 rep("\\textit{t}",4),"$\\chi^2$",
+															 rep("\\textit{t}",4),"$\\chi^2$"),
+											Test.value = c(summary(m.count)$coef[, 4, drop = FALSE],lmerTest::rand(m.count)$LRT[2],
+																		 summary(m.mean_mean_abs)$coef[, 4, drop = FALSE],lmerTest::rand(m.mean_mean_abs)$LRT[2],
+																		 summary(m.corr)$coef[, 4, drop = FALSE],lmerTest::rand(m.corr)$LRT[2],
+																		 summary(m.iso)$coef[, 4, drop = FALSE],lmerTest::rand(m.iso)$LRT[2]),
+											p.value = c(summary(m.count)$coef[, 5, drop = FALSE],lmerTest::rand(m.count)$`Pr(>Chisq)`[2],
+																	summary(m.mean_mean_abs)$coef[, 5, drop = FALSE],lmerTest::rand(m.mean_mean_abs)$`Pr(>Chisq)`[2],
+																	summary(m.corr)$coef[, 5, drop = FALSE],lmerTest::rand(m.corr)$`Pr(>Chisq)`[2],
+																	summary(m.iso)$coef[, 5, drop = FALSE],lmerTest::rand(m.iso)$`Pr(>Chisq)`[2]))
+	} else {
+		tab <- data.frame()
+	}
+	return(list(newdat, tab))
+}
+
+
+rq1_fct <- function(dd_smap, ddrq1, cv.dd=cv, permutation_entropies.dd=permutation_entropies, iso=T, corr=T, count=T, mean_mean_abs=T, table=T) {
+	# first the dataset
+	dd_smap_params_abs <- dd_smap %>%
+		dplyr::filter(target!="temperature" & target!="dissolved_oxygen") %>%
+		dplyr::group_by(ID,Interaction,treat,treat2,treat3,target,interactor) %>%
+		summarize(mean = mean(Interaction_strength),
+							mean.abs = mean(abs(Interaction_strength)),
+							median = median(Interaction_strength),
+							sd = sd(Interaction_strength),
+							iqr = IQR(Interaction_strength),
+							signal.to.noise = mean(Interaction_strength)/sd(Interaction_strength),
+							signal.to.noise.abs = mean(abs(Interaction_strength))/sd(abs(Interaction_strength))) %>%
+		group_by(target,treat,ID,treat2,treat3) %>%
+		rename(Target=target) %>% 
+		summarize(sum_abs_mu = sum(abs(mean)),
+							sum_mean_abs = sum(mean.abs),
+							count = n(),
+							mean_abs_mean = mean(abs(mean)),
+							mean_mean_abs = mean(mean.abs),
+							median_mean_abs = median(mean.abs)) 
+	
+	ddrq1_treat_14 <- ddrq1 %>%
+		dplyr::filter(num_pred==14) %>%
+		group_by(Target,treat,ID,treat2,treat3) %>%
+		full_join(dd_smap_params_abs)
+	
+	ddrq1_treat_14 <- full_join(ddrq1_treat_14, cv.dd)
+	ddrq1_treat_14 <- full_join(ddrq1_treat_14, permutation_entropies.dd)
+	
+	ddrq1_treat_14$target <- ddrq1_treat_14$Target
+
+	rq1_model_fcts_list <- rq1_model_fcts(ddrq1_treat_14, iso, corr, count, mean_mean_abs, table)
+	
+	
+	return(c(list(ddrq1_treat_14), rq1_model_fcts_list, list(dd_smap_params_abs)))
+}
+```
+
+
+```{r rmse_vs_numbInteraction_and_interStrength, warning=FALSE, cache=TRUE, message=FALSE}
+cmult <- 1.96
+rq1_list <- rq1_fct(dd_smap, ddrq1)
+ddrq1_treat_14_theta5 <- ddrq1_treat_14 <- rq1_list[[1]]
+newdat_theta5 <- newdat <- rq1_list[[2]]
+tab.rq1.theta5 <- rq1_list[[3]]
+dd_smap_params_abs <- rq1_list[[4]]
+newdat_theta5$theta = 5
+ddrq1_treat_14_theta5$theta = 5
+tab.rq1.theta5 <- cbind(theta=5,tab.rq1.theta5)
+```
+
+
+
+## Forecast error vs. increasing number of predictors 
+
+
+```{r increasing_predictors, cache=TRUE, fig.width=10, fig.height=6, message=FALSE, warning=FALSE}
+cbbPalette <- c("#56B4E9", "#000000", "#E69F00", "#009E73")
+ddrq1_summarized$interaction <- interaction(ddrq1_summarized$temperature_included, 	ddrq1_summarized$treat)
+ddrq1_summarized$Target2 <- label[ddrq1_summarized$Target]
+
+########################
+# Big model
+
+m.mv2 <- lmer(median_rmse ~ temperature_included*log10(num_pred) + 
+						 	treat*log10(num_pred)  + treat*temperature_included +
+						 	log10(num_pred)*Target + temperature_included*Target + 
+						 	treat*Target + (1|Target:ID),
+						 data = ddrq1_summarized)
+
+newdat.mv <- with(ddrq1_summarized,
+									expand.grid(temperature_included = unique(temperature_included),
+															treat = unique(treat),
+															num_pred = unique(num_pred),
+															Target = unique(Target),
+															median_rmse=0))
+
+newdat.mv2 <- with(ddrq1_summarized,
+									expand.grid(temperature_included = unique(temperature_included),
+															treat = unique(treat),
+															num_pred = unique(num_pred),
+															Target = unique(Target),
+															ID = unique(ID)))
+
+newdat.mv2 <- cbind(newdat.mv2,
+										predictInterval(m.mv2, newdata = newdat.mv2, which = "fixed", level=0.95, include.resid.var = F)) 
+
+newdat.mv2 <- newdat.mv2 %>%
+	dplyr::rename(lower=lwr, upper=upr, median_rmse=fit)
+newdat.mv2$Target2 <- label[as.character(newdat.mv2$Target)]
+
+cbbPalette <- c("#56B4E9", "#000000", "#E69F00", "#009E73")
+
+plot2list <- split(ddrq1_summarized, ddrq1_summarized$Target)
+plot2listnew <- list()
+j <- 1
+for(i in 1:length(plot2list)){
+	df <- plot2list[[i]]
+	nd <- newdat.mv2 %>% dplyr::filter(Target==unique(df$Target))
+	a <- df %>% ggplot(aes(log10(num_pred), median_rmse,
+												 group=interaction(ID,interaction),
+												 col=interaction))+
+		geom_line(size=0.5, alpha=0.35)+
+		geom_point(na.rm = T, size=0.7, alpha=0.7)+
+		standard_theme()+
+		theme(legend.position = "none", axis.title = element_blank(),
+					plot.margin = margin(r=-1, l=10), plot.subtitle = ggtext::element_markdown())+
+		scale_color_manual(values = cbbPalette, aesthetics = c("col","fill"),
+											 labels = c("Constant & Not a predictor","Constant & Predictor","Fluctuating & Not a predictor","Fluctuating & Predictor")) +
+		scale_x_continuous(breaks = c(0,0.3,0.6,1))+
+		labs(y="Median RMSE",x="log10(Number of predictors used)", col="Temperature", tag=tag[i], subtitle = unique(df$Target2)) +
+		guides(col=guide_legend(nrow=2,byrow=TRUE))
+	
+	nd$Target2<- ""
+	b <- nd %>%
+		ggplot(aes(log10(num_pred), median_rmse, col=interaction(temperature_included,treat),
+							 fill=interaction(temperature_included,treat)))+
+		geom_ribbon(aes(ymin=lower,ymax=upper), alpha=0.2, size=0.1)+
+		geom_line(size=1, alpha=0.5)+
+		standard_theme()+
+		theme(legend.position = "none", axis.title = element_blank(), axis.text.y = element_blank(), axis.ticks.y=element_blank(),
+					plot.margin = margin(l=-1,r=3))+
+		scale_color_manual(values = cbbPalette, aesthetics = c("col","fill"),
+											 labels = c("Constant & Not a predictor","Constant & Predictor","Fluctuating & Not a predictor","Fluctuating & Predictor")) +
+		labs(y="Median RMSE",x="log10(Number of predictors used)", col="Temperature", fill="Temperature") +
+		scale_x_continuous(breaks = c(0,0.3,0.6,1))+
+		guides(col=guide_legend(nrow=2,byrow=TRUE)) +
+		ylim(ggplot_build(a)$layout$panel_scales_y[[1]]$range$range)
+	
+	if(i %in% 7:8) {
+		a <- a + theme(plot.margin = margin(r=-1, l=10, b=10))
+		b <- b + theme(plot.margin = margin(l=-1, r=3, b=10))
+	}
+	plot2listnew[[j]] <- a
+	plot2listnew[[j+1]] <- b
+	j <- j + 2
+}
+
+plot2leg <- ddrq1_summarized %>% ggplot(aes(log10(num_pred), median_rmse,
+												 group=interaction(ID,interaction),
+												 col=interaction))+
+	geom_smooth(aes(fill=interaction), col=NA)+
+	geom_line(size=0.5, alpha=1)+
+	geom_point(na.rm = T, size=0.7, alpha=1)+
+	standard_theme()+
+	theme(legend.position = "bottom", axis.title = element_blank(),
+				plot.margin = margin(r=-1, l=10), plot.subtitle = ggtext::element_markdown())+
+	scale_color_manual(values = cbbPalette, aesthetics = c("col","fill"),
+										 labels = c("Constant & Not a predictor","Constant & Predictor","Fluctuating & Not a predictor","Fluctuating & Predictor")) +
+	scale_x_continuous(breaks = c(0,0.3,0.6,1))+
+	labs(y="Median RMSE",x="log10(Number of predictors used)", col="Temperature", fill="Temperature", tag=tag[i], subtitle = unique(df$Target2)) +
+	guides(col=guide_legend(nrow=2,byrow=TRUE))
+
+plot2leg <- get_legend(plot2leg)
+
+ylab <- ggplot(data.frame(l = "            Forecast error (median RMSE)", x = 1, y = 1)) +
+	geom_text(aes(x, y, label = l), angle = 90, size=5) + 
+	theme_void() +
+	coord_cartesian(clip = "off")
+
+xlab <- ggplot(data.frame(x = 1, y = 1)) +
+	geom_text(aes(x, y), label = expression('log'[10]~"(Number of predictors used)"), size=5) + 
+	theme_void() +
+	coord_cartesian(clip = "off")
+
+covariates.mv.t  <- c("(Intercept)","temperature_includedTRUE","log10(num_pred)","treattreat",
+											"temperature_includedTRUE:log10(num_pred)","log10(num_pred):treattreat",
+											"temperature_includedTRUE:treattreat")
+index.mv.t <- which(names(fixef(m.mv2)) %in% covariates.mv.t)
+covariates.mv.F <- rownames(anova(m.mv2))[c(4,8,9,10)]
+
+
+mv.tab <- data.frame(Covariate = c("\\textbf{Intercept}","\\textbf{A: Temperature is predictor}","\\textbf{B: log10(nr. of predictors)}",
+										 							"\\textbf{C: Fluctuating temperature}",
+										 							"\\textit{C. reinhardtii}", "\\textit{C. striatum}", "\\textit{D. campylum}",
+										 							"\\textit{E. gracilis}", "\\textit{E. daidaleos}", "\\textit{P. caudatum}", "\\textit{Rotifer} sp.",
+										 							"\\textbf{Interaction: A:B}", "\\textbf{Interaction: B:C}", "\\textbf{Interaction: A:C}",
+										 							"\\textit{C. reinhardtii}", "\\textit{C. striatum}", "\\textit{D. campylum}",
+										 							"\\textit{E. gracilis}", "\\textit{E. daidaleos}", "\\textit{P. caudatum}", "\\textit{Rotifer} sp.",
+										 							"\\textit{C. reinhardtii}", "\\textit{C. striatum}", "\\textit{D. campylum}",
+										 							"\\textit{E. gracilis}", "\\textit{E. daidaleos}", "\\textit{P. caudatum}", "\\textit{Rotifer} sp.",
+										 							"\\textit{C. reinhardtii}", "\\textit{C. striatum}", "\\textit{D. campylum}",
+										 							"\\textit{E. gracilis}", "\\textit{E. daidaleos}", "\\textit{P. caudatum}", "\\textit{Rotifer} sp."),
+										 Estimate_type = "Coefficient",
+										 Estimate = c(fixef(m.mv2)),
+										 DF= c(round(summary(m.mv2)$coef[,3,drop = FALSE],0)),
+										 Std.err = c(summary(m.mv2)$coef[,2,drop = FALSE]),
+										 Test = "\\textit{t}",
+										 Test.value = c(summary(m.mv2)$coef[,4,drop = FALSE]),
+										 p.value = c(summary(m.mv2)$coef[, 5, drop = FALSE]))
+
+
+
+mv.tab.anova <- data.frame(Covariate = c("\\textbf{A: Temperature is predictor}","\\textbf{B: log10(nr. of predictors)}",
+													 							"\\textbf{C: Fluctuating temperature}", "\\textbf{D: Target species}",
+													 							"\\textbf{Interaction: A:B}", "\\textbf{Interaction: B:C}", "\\textbf{Interaction: A:C}", 
+													 							"\\textbf{Interaction: B:D}", "\\textbf{Interaction: A:D}", "\\textbf{Interaction: C:D}"),
+													 Estimate_type = "Sum of sq.",
+													 Estimate = anova(m.mv2)[,1],
+													 DF= paste(anova(m.mv2)[,3],round(anova(m.mv2)[,4],1), sep = ", "),
+													 Std.err = NA,
+													 Test = "$\\chi^2$",
+													 Test.value = anova(m.mv2)[,5],
+													 p.value = anova(m.mv2)[,6])
+
+
+mv.tab.rand <- data.frame(Covariate = "\\textbf{Bottle ID nested in Target}",
+													Estimate_type = "Rand. effect",
+													Estimate = as.data.frame(VarCorr(m.mv2))$sdcor[1],
+													DF= lmerTest::rand(m.mv2)$Df[2],
+													Std.err = NA,
+													Test = "$\\chi^2$",
+													Test.value = lmerTest::rand(m.mv2)$LRT[2],
+													p.value = lmerTest::rand(m.mv2)$`Pr(>Chisq)`[2])
+	
+
+
+mv.tab <- rbind(mv.tab,mv.tab.anova,mv.tab.rand)
+ 
+rm(a,b,df,plot2list,nd, newdat.mv)
+```
+
+
+
+## Number of predictors in best model vs number of interactors
+
+
+The following chunk is not run. Its results are loaded in the successive chunk
+
+
+```{r interactors_used_as_predictors, cache=TRUE, message=FALSE, eval=FALSE}
+## using only the species that significantly interacted with the target as predictors in the forecasting
+
+significant_pairwise_ccm_df_summarized <- significant_pairwise_ccm_df %>%
+	group_by(treat, ID, target) %>%
+	summarize(interactor_combination = paste(interactor, collapse = " "))
+
+temp.list <- split(significant_pairwise_ccm_df_summarized, f = significant_pairwise_ccm_df_summarized$ID)
+
+mvForecasts_interactorsAsPredictors <- mclapply(temp.list, function(sig_df){
+	temp <- apply(sig_df, 1, function(row){
+		df <- dd2 %>% dplyr::filter(ID==row["ID"])
+		predictors <- strsplit(unlist(row["interactor_combination"]), " ")
+		model_fitter(data = df, target = unname(row["target"]),
+								 predictor_combinations = predictors, max_lag = 3,
+								 E = 3, ID = row["ID"], k = ks)
+	})
+	do.call("rbind", temp)
+}, mc.cores = detectCores()-1)
+
+mvForecasts_interactorsAsPredictors_E2 <- mclapply(temp.list, function(sig_df){
+	temp <- apply(sig_df, 1, function(row){
+		df <- dd2 %>% dplyr::filter(ID==row["ID"])
+		predictors <- strsplit(unlist(row["interactor_combination"]), " ")
+		model_fitter(data = df, target = unname(row["target"]),
+								 predictor_combinations = predictors, max_lag = 3,
+								 E = 2, ID = row["ID"], k = ks)
+	})
+	do.call("rbind", temp)
+}, mc.cores = detectCores()-1)
+
+mvForecasts_interactorsAsPredictors_E4 <- mclapply(temp.list, function(sig_df){
+	temp <- apply(sig_df, 1, function(row){
+		df <- dd2 %>% dplyr::filter(ID==row["ID"])
+		predictors <- strsplit(unlist(row["interactor_combination"]), " ")
+		model_fitter(data = df, target = unname(row["target"]),
+								 predictor_combinations = predictors, max_lag = 3,
+								 E = 4, ID = row["ID"], k = ks)
+	})
+	do.call("rbind", temp)
+}, mc.cores = detectCores()-1)
+
+mvForecasts_interactorsAsPredictors <- 	do.call("rbind", mvForecasts_interactorsAsPredictors)
+mvForecasts_interactorsAsPredictors_E2 <- 	do.call("rbind", mvForecasts_interactorsAsPredictors_E2)
+mvForecasts_interactorsAsPredictors_E4 <- 	do.call("rbind", mvForecasts_interactorsAsPredictors_E4)
+
+save(mvForecasts_interactorsAsPredictors, file = here("Data/Multiview_forecast_data/mvForecasts_interactorsAsPredictors.RData"))
+save(mvForecasts_interactorsAsPredictors_E2, file = here("Data/Multiview_forecast_data/mvForecasts_interactorsAsPredictors_E2.RData"))
+save(mvForecasts_interactorsAsPredictors_E4, file = here("Data/Multiview_forecast_data/mvForecasts_interactorsAsPredictors_E4.RData"))
+```
+
+
+```{r number_of_interactors_vs_number_of_predictors, cache=TRUE, fig.width=10, fig.height=6, message=FALSE}
+load(here("Data/Multiview_forecast_data/mvForecasts_interactorsAsPredictors.RData")) # done previously
+
+ddrq1$temperature_included <- as.logical(ddrq1$temperature_included)
+ddrq1$target_excluded <- as.logical(ddrq1$target_excluded)
+ddrq1 <- full_join(ddrq1, mvForecasts_interactorsAsPredictors)
+ddrq1 <- ddrq1 %>%
+	group_by(ID, treat, Target) %>%
+	mutate(best_rmse_bool = RMSE==min(RMSE),
+				 min_rmse = min(RMSE)) %>%
+	mutate(RMSE_equi = case_when(abs(RMSE-min_rmse)/((RMSE+min_rmse)/2) <= 0.01 ~ T,
+															 abs(RMSE-min_rmse)/((RMSE+min_rmse)/2) > 0.01 ~ F))
+
+ddrq1_equi <- ddrq1
+
+ddrq1_best <- ddrq1 %>% 
+	dplyr::filter(RMSE_equi==T) %>%
+	group_by(ID, treat, Target) %>%
+	slice_min(num_pred,n=1) %>%
+	slice_min(RMSE,n=1) %>% 
+	sample_n(1)
+
+ddrq1_best <- full_join(ddrq1_best, dd_smap_params_abs)
+
+ddrq1_best$Treat <- ifelse(ddrq1_best$treat=="const",
+														 "Constant temperature","Fluctuating temperature")
+ddrq1_best$treat4 <- ifelse(ddrq1_best$treat=="const","Constant","Fluctuating")
+ddrq1_best$Target <- label[ddrq1_best$Target]
+ddrq1_best$log10_num_pred <- log10(ddrq1_best$num_pred)
+ddrq1_best$sqrtsqrtcount <- sqrt(sqrt(ddrq1_best$count))
+ddrq1_best$sqrtsqrt_num_pred <- sqrt(sqrt(ddrq1_best$num_pred))
+m.numpred.numint <- lmer(log10_num_pred~count*treat + (1|ID), data = ddrq1_best)
+
+newdat.numpred <- expand.grid(count = seq(min(ddrq1_best$count), max(ddrq1_best$count),length.out = 200),
+                          treat = unique(ddrq1_best$treat))
+newdat.numpred$log10_num_pred <- predict(m.numpred.numint, newdat.numpred, re.form=NA)
+mm.numpred <- model.matrix(terms(m.numpred.numint),newdat.numpred)
+pvar1.numpred <- diag(mm.numpred %*% tcrossprod(vcov(m.numpred.numint),mm.numpred))
+newdat.numpred <- data.frame(newdat.numpred,
+														 lower.numpred=newdat.numpred$log10_num_pred-cmult*sqrt(pvar1.numpred),
+														 upper.numpred=newdat.numpred$log10_num_pred+cmult*sqrt(pvar1.numpred))
+
+
+tab.num_vs_num <- data.frame(Covariate = c("Intercept","Number of interactions",
+																					 "Fluctuating temperature","Interaction","Bottle ID"),
+														 Var_Type = c("Fixed","Fixed","Fixed","Fixed","Std. Dev."),
+														 Coefficient = c(fixef(m.numpred.numint),as.data.frame(VarCorr(m.numpred.numint))$sdcor[1]),
+														 Std.err = c(summary(m.numpred.numint)$coef[, 2, drop = FALSE],NA),
+														 Test = c(rep("\\textit{t}",4),"$\\chi^2$"),
+														 Test.value = c(summary(m.numpred.numint)$coef[, 4, drop = FALSE],lmerTest::rand(m.numpred.numint)$LRT[2]),
+														 p.value = c(summary(m.numpred.numint)$coef[, 5, drop = FALSE],lmerTest::rand(m.numpred.numint)$`Pr(>Chisq)`[2]))
+
+rm(mvForecasts_interactorsAsPredictors, mm.numpred)
+load(here("Data/Multiview_forecast_data/ddrq1_transf_resid_which_all.RData"))  # reloaded.. same as above
+ddrq1 <- ddrq1 %>% na.omit()
+
+ddrq1_best_suppl <- ddrq1_best
+```
+
+
+## Predictor importance vs interaction strength vs RMSE
+
+```{r predictor_interactor, cache=TRUE, message=FALSE, warning=FALSE}
+ddrq1_importance <- ddrq1 %>%
+  dplyr::filter(num_pred==1) %>%
+  full_join(dd_smap_params_abs)
+
+ddrq1_importance$predictor_combination <- ifelse(ddrq1_importance$predictor_combination=="small-white_particle","small_white_particle",
+																								 ifelse(ddrq1_importance$predictor_combination=="green-white_particle","green_white_particle",
+																								 			 ddrq1_importance$predictor_combination))
+
+ddrq1_importance$target <- ddrq1_importance$Target
+ddrq1_importance$interactor <- ddrq1_importance$predictor_combination
+
+dd_mean_is <- dd_smap %>%
+  dplyr::filter(target!="temperature" & target!="dissolved_oxygen") %>%
+  dplyr::group_by(ID,Interaction,treat,treat2,treat3,target,interactor) %>%
+  summarize(mean = mean(Interaction_strength),
+            mean.abs = mean(abs(Interaction_strength)),
+            median = median(Interaction_strength),
+            sd = sd(Interaction_strength),
+            iqr = IQR(Interaction_strength),
+  					signal.to.noise = mean(Interaction_strength)/sd(Interaction_strength),
+  					signal.to.noise.abs = mean(abs(Interaction_strength))/sd(abs(Interaction_strength))) %>%
+  mutate(sd.transformed = log10(sd),
+         mean.transformed = abs(mean)^(1/4),
+         mean.abs.transformed = (mean.abs)^(1/4),
+         iqr.transformed = log10(iqr),
+         median.transformed = abs(median)^(1/4))
+
+ddrq1_importance <- inner_join(ddrq1_importance, dd_mean_is)
+
+ddrq1_importance$log10.mean.abs <- log10(ddrq1_importance$mean.abs)
+m.pred.imp <- lmer(RMSE~log10.mean.abs*treat*Target + (1|ID), data = ddrq1_importance)
+
+temp <- split(ddrq1_importance, f = interaction(ddrq1_importance$Target,ddrq1_importance$treat))
+ 
+newdat.m.pred.imp <- lapply(temp, function(df){
+  expand.grid(log10.mean.abs = seq(min(df$log10.mean.abs, na.rm = T),max(df$log10.mean.abs, na.rm = T),length.out = 100),
+              treat = unique(df$treat),
+              Target = unique(df$Target))
+})
+
+newdat.m.pred.imp <- do.call("rbind", newdat.m.pred.imp)
+newdat.m.pred.imp <- cbind(newdat.m.pred.imp,RMSE=predict(m.pred.imp, newdat.m.pred.imp, re.form=NA))
+
+m.pred.imp.model.matrix <- model.matrix(terms(m.pred.imp),newdat.m.pred.imp)
+
+pvar1.m.pred.imp <- diag(m.pred.imp.model.matrix %*% tcrossprod(vcov(m.pred.imp),m.pred.imp.model.matrix))
+
+newdat.m.pred.imp <- data.frame(newdat.m.pred.imp,
+                         lower=newdat.m.pred.imp$RMSE-cmult*sqrt(pvar1.m.pred.imp),
+                         upper=newdat.m.pred.imp$RMSE+cmult*sqrt(pvar1.m.pred.imp))
+
+newdat.m.pred.imp$treat <- ifelse(newdat.m.pred.imp$treat=="const","Constant","Fluctuating")
+ddrq1_importance$treat <- ifelse(ddrq1_importance$treat=="const","Constant","Fluctuating")
+
+order.interactors <- c("Bacteria","*Chlamydomonas reinhardtii*","*Colpidium striatum*",
+											 "*Dexiostoma campylum*","*Didinium nasutum*","*Euglena gracilis*","*Euplotes daidaleos*",
+											 "*Paramecium caudatum*","*Rotifer* sp.","Big and white flagellates","Green and white flagellates",
+											 "Small and white flagellates","Dissolved oxygen","Temperature")
+
+order.targets <- c("Bacteria","*Chlamydomonas reinhardtii*","*Colpidium striatum*",
+									 "*Dexiostoma campylum*","*Euglena gracilis*","*Euplotes daidaleos*",
+									 "*Paramecium caudatum*","*Rotifer* sp.")
+
+ddrq1_importance$interactor <- factor(label[ddrq1_importance$interactor], levels = order.interactors)
+ddrq1_importance$Target <- factor(label[ddrq1_importance$Target], levels = order.targets)
+newdat.m.pred.imp$Target <- label[as.vector(newdat.m.pred.imp$Target)]
+
+# palette <- colorRampPalette(brewer.pal(name="Paired", n = 12))(14)
+palette2 <- c(brewer.pal(name="Paired", n = 12),"black","grey")
+palette2[[11]] <- "#fafa00"
+
+
+covariates.m.pred.imp  <- c("(Intercept)","log10.mean.abs","treattreat",
+														"log10.mean.abs:treattreat")
+index.m.pred.imp <- which(names(fixef(m.pred.imp)) %in% covariates.m.pred.imp)
+
+
+mv.interactopredictor <- data.frame(Covariate = c("\\textbf{Intercept}","\\textbf{A: log10(mean int. strength)}",
+																									"\\textbf{B: Fluctuating temperature}", 
+																									# "C: Target species", 
+																									"\\textit{C. reinhardtii}", "\\textit{C. striatum}", "\\textit{D. campylum}",
+																									"\\textit{E. gracilis}", "\\textit{E. daidaleos}", "\\textit{P. caudatum}", "\\textit{Rotifer} sp.",
+																									"\\textbf{Interaction: A:B}",
+																									# "Interaction: A:C", 
+																									"\\textit{C. reinhardtii}", "\\textit{C. striatum}", "\\textit{D. campylum}",
+																									"\\textit{E. gracilis}", "\\textit{E. daidaleos}", "\\textit{P. caudatum}", "\\textit{Rotifer} sp.",
+																									# "Interaction: B:C", 
+																									"\\textit{C. reinhardtii}", "\\textit{C. striatum}", "\\textit{D. campylum}",
+																									"\\textit{E. gracilis}", "\\textit{E. daidaleos}", "\\textit{P. caudatum}", "\\textit{Rotifer} sp.",																														# "Interaction: A:B:C", 
+																									"\\textit{C. reinhardtii}", "\\textit{C. striatum}", "\\textit{D. campylum}",
+																									"\\textit{E. gracilis}", "\\textit{E. daidaleos}", "\\textit{P. caudatum}", "\\textit{Rotifer} sp."),
+																		Estimate_type = "Coefficient",
+																		Estimate = c(fixef(m.pred.imp)),
+																		DF= c(round(summary(m.pred.imp)$coef[,3,drop = FALSE],0)),
+																		Std.err = c(summary(m.pred.imp)$coef[,2,drop = FALSE]),
+																		Test = "\\textit{t}",
+																		Test.value = c(summary(m.pred.imp)$coef[,4,drop = FALSE]),
+																		p.value = c(summary(m.pred.imp)$coef[, 5, drop = FALSE]))
+
+
+mv.interactopredictor.anova <- data.frame(Covariate = c("\\textbf{A: log10(mean int. strength))}","\\textbf{B: Fluctuating temperature}",
+																												"\\textbf{C: Target species}",
+																												"\\textbf{Interaction: A:B}", "\\textbf{Interaction: A:C}", "\\textbf{Interaction: B:C}", 
+																												"\\textbf{Interaction: A:B:C}"),
+																					Estimate_type = "Sum of sq.",
+																					Estimate = anova(m.pred.imp)[,1],
+																					DF= paste(anova(m.pred.imp)[,3],round(anova(m.pred.imp)[,4],1), sep = ", "),
+																					Std.err = NA,
+																					Test = "$\\chi^2$",
+																					Test.value = anova(m.pred.imp)[,5],
+																					p.value = anova(m.pred.imp)[,6])
+
+
+mv.interactopredictor.rand <- data.frame(Covariate = "\\textbf{Bottle ID}",
+																					Estimate_type = "Rand. effect",
+																					Estimate = as.data.frame(VarCorr(m.pred.imp))$sdcor[1],
+																					DF= lmerTest::rand(m.pred.imp)$Df[2],
+																					Std.err = NA,
+																					Test = "$\\chi^2$",
+																					Test.value = lmerTest::rand(m.pred.imp)$LRT[2],
+																					p.value = lmerTest::rand(m.pred.imp)$`Pr(>Chisq)`[2])
+
+mv.interactopredictor <- rbind(mv.interactopredictor, mv.interactopredictor.anova, mv.interactopredictor.rand)
+
+
+rm(temp, covariates.m.pred.imp, covariates.mv.F, covariates.mv.t, i, j, index.m.pred.imp, index.mv.t, pvar1.m.pred.imp, pvar1.numpred)
+```
+
+# Results and figures (main text)
+
+## Relation between number of interactions, mean interaction strength and forecast error
+
+```{r mean_int_rmse_plot, fig.width=13, fig.height=6.5, out.width="95%", cache=TRUE, message=FALSE}
+ddrq1_treat_14$treat <- ifelse(ddrq1_treat_14$treat=="const","Constant","Fluctuating")
+ddrq1_treat_14$Target2 <- label[ddrq1_treat_14$Target]
+plot_leg <-
+	ddrq1_treat_14 %>%
+	ggplot(aes(count,RMSE, group=treat, shape=treat, col=Target2, fill=Target2))+
+	geom_point(size=2.5)+
+	scale_shape_manual(values=c(21,23))+
+	scale_fill_brewer(palette = "Dark2", aesthetics = c("fill","col"))+
+	standard_theme()+
+	theme(legend.position = "right", legend.box="vertical",
+				legend.text = ggtext::element_markdown()) +
+	labs(shape="Temperature", fill= "Target", col="Target") +
+	guides(fill=guide_legend(nrow=8,byrow=TRUE), shape=guide_legend(nrow=2,byrow=TRUE))
+
+plot1a <- ddrq1_treat_14 %>%
+  ggplot(aes(count,RMSE, group=treat, shape=treat))+
+  geom_line(data=newdat_theta5 %>% dplyr::filter(model=="count"))+
+  geom_ribbon(data=newdat_theta5 %>% dplyr::filter(model=="count"), aes(ymax=lower.count,ymin=upper.count), alpha=0.2, col=NA) +
+  geom_point(aes(fill=Target2),size=2.5,col="black")+
+	scale_shape_manual(values=c(21,23))+
+	scale_fill_brewer(palette = "Dark2")+
+  standard_theme()+
+  facet_wrap(~treat)+
+	theme(legend.position = "none",
+				panel.spacing =  unit(0, "lines"),
+				strip.text.x = element_blank(),
+				plot.subtitle = ggtext::element_markdown()) +
+	labs(x=expression("Number of interactions"~italic(N[T])), y="Forecast error (RMSE)", tag = "A")
+
+plot1b <- ddrq1_treat_14 %>%
+  ggplot(aes(mean_mean_abs,RMSE, group=treat, shape=treat))+
+  geom_line(data=newdat_theta5 %>% dplyr::filter(model=="mean_mean_abs"))+
+  geom_ribbon(data=newdat_theta5 %>% dplyr::filter(model=="mean_mean_abs"), aes(ymax=lower.mean_mean_abs,ymin=upper.mean_mean_abs), alpha=0.2, col=NA) +
+  geom_point(aes(fill=Target2),size=2.5, col="black")+
+	scale_shape_manual(values=c(21,23))+
+	scale_fill_brewer(palette = "Dark2")+
+  standard_theme()+
+  facet_wrap(~treat)+
+	theme(legend.position = "none",
+				panel.spacing =  unit(0, "lines"),
+				strip.text.x = element_blank(),
+				plot.subtitle = ggtext::element_markdown()) +
+	labs(x=expression("Mean interaction strength"~italic(mu["T"])), y="Forecast error (RMSE)", tag = "B")
+
+plot1c <- ddrq1_treat_14 %>%
+  ggplot(aes(count, mean_mean_abs, group=treat, shape=treat))+
+  geom_line(data=newdat_theta5 %>% dplyr::filter(model=="corr"))+
+  geom_ribbon(data=newdat_theta5 %>% dplyr::filter(model=="corr"), aes(ymax=lower.corr,ymin=upper.corr), alpha=0.2, col=NA) +
+  geom_point(aes(fill=Target2),size=2.5, col="black")+
+	scale_shape_manual(values=c(21,23))+
+	scale_fill_brewer(palette = "Dark2")+
+	standard_theme()+
+	theme(legend.position = "none",
+				panel.spacing =  unit(0, "lines"),
+				strip.text.x = element_blank(),
+				plot.subtitle = ggtext::element_markdown()) +
+	facet_wrap(~treat) +
+	labs(x=expression("Number of interactions"~italic(N[T])),
+			 y=expression("Mean interaction strength"~italic(mu["T"])), tag = "C")
+
+plot1d <- ddrq1_treat_14 %>%
+  ggplot(aes(sum_mean_abs,RMSE, group=treat, shape=treat))+
+  # geom_line(data=newdat_theta5 %>% dplyr::filter(model=="iso"))+
+  # geom_ribbon(data=newdat_theta5 %>% dplyr::filter(model=="iso"), aes(ymax=lower.iso,ymin=upper.iso), alpha=0.2, col=NA) +
+  geom_point(aes(fill=Target2),size=2.5, col="black")+
+	scale_shape_manual(values=c(21,23))+
+	scale_fill_brewer(palette = "Dark2")+
+	standard_theme()+
+	theme(legend.position = "none",
+				panel.spacing =  unit(0, "lines"),
+				strip.text.x = element_blank(),
+				plot.subtitle = ggtext::element_markdown()) +
+	facet_wrap(~treat)+
+	labs(x=expression("Sum of interaction strength"~Sigma[italic("T")]), y="Forecast error (RMSE)", tag = "D")
+
+plot1_leg <- get_legend(plot_leg)
+
+plot1 <- ((plot1a+plot1b+plot1c+plot1d + plot_layout(ncol = 2)) | plot1_leg ) + plot_layout(widths = c(3,1))
+plot1
+rm(plot1a, plot1b, plot1c, plot1d, plot_leg, plot1_leg)
+```
+
+
+## Forecast error as a function of number of predictors and temperature
+
+```{r rmse_vs_numpred, fig.width=10, fig.height=10, out.width="95%", cache=TRUE, message=FALSE, warning=FALSE}
+plot2 <- ((ylab + ((Reduce("+", plot2listnew) + plot_layout(ncol = 4)) / xlab + plot_layout(heights = c(50,1))) + plot_layout(widths = c(1,50)))) / plot2leg + plot_layout(heights = c(51,6)) 
+plot2
+```
+
+```{r num_int_vs_numb_pred, fig.width=6, fig.height=7, out.width="47.5%", cache=TRUE, message=FALSE}
+plot3_leg <-
+	ddrq1_best %>%
+	ggplot(aes(count,num_pred, group=treat4, col=Target, fill=Target))+
+	geom_point(size=2, shape=21)+
+	scale_fill_brewer(palette = "Dark2", aesthetics = c("fill","col"))+
+	standard_theme()+
+	labs(col="Target",fill="Target")+
+	theme(legend.position = "right", legend.box="horizontal",
+				legend.text = ggtext::element_markdown(size = 11),
+				legend.title = element_text(size=12)) +
+	guides(fill=guide_legend(nrow=3,byrow=TRUE), shape=guide_legend(nrow=2,byrow=TRUE))
+
+newdat.numpred$Treat <- ifelse(newdat.numpred$treat=="const",
+														 "Constant temperature","Fluctuating temperature")
+newdat.numpred$treat4 <- ifelse(newdat.numpred$treat=="const","Constant","Fluctuating")
+
+plot3a <-
+	ddrq1_best %>%
+	ggplot(aes(count,num_pred, group=treat4)) +
+  geom_line(data=newdat.numpred, mapping = aes(count,10^log10_num_pred))+
+  geom_ribbon(data=newdat.numpred, aes(y=10^log10_num_pred,  ymax=10^lower.numpred,ymin=10^upper.numpred), alpha=0.2, col=NA) +
+	geom_point(aes(fill=Target),size=2.5,col="black", alpha=0.5, shape=21)+
+	scale_fill_brewer(palette = "Dark2")+
+	facet_wrap(~Treat) +
+	standard_theme() +
+	labs(x=expression("Number of interactions"~italic(N[T])), y="Number of predictors\nin best model",
+			 tag="A")+
+	theme(legend.position = "none", legend.box="vertical",
+				axis.title = element_text(size=12),
+				axis.text = element_text(size=11),
+				strip.text = element_text(size=12, hjust = 0, vjust = 1.8, margin = margin(t = 2, r = 0, b = 0, l = 0, unit = "pt"))) + 
+	scale_y_continuous(breaks = seq(2, 10, len = 5))
+
+plot3b <- ddrq1_best %>%
+	ggplot(aes(num_pred, fill=Target)) +
+	geom_bar() +
+	scale_fill_brewer(palette = "Dark2")+
+	standard_theme()+
+	facet_wrap(~Treat) +
+	scale_x_continuous(breaks = seq(1,13,by = 2)) +
+	labs(x="Number of predictors in best model", y="Count",
+			 tag="B")+
+	theme(legend.position = "none", legend.box="vertical",
+				axis.title = element_text(size=12),
+				axis.text = element_text(size=11),
+				strip.text = element_text(size=12, hjust = 0, vjust = 1.8, margin = margin(t = 2, r = 0, b = 0, l = 0, unit = "pt")))
+
+plot3_leg <- get_legend(plot3_leg)
+
+plot3main <- plot3a/plot3b/plot3_leg + plot_layout(heights = c(3.5,3.5,1.7))
+plot3main
+```
+
+
+## Interactor strength versus predictor importance
+
+```{r pred_imp_plot, fig.width=13, fig.height=9, out.width="95%", cache=TRUE, message=FALSE, warning=FALSE}
+ddrq1_importance_list <- split(ddrq1_importance, ddrq1_importance$Target)
+
+ddrq1_importance_list <- lapply(1:length(ddrq1_importance_list), function(i){
+	df <- ddrq1_importance_list[[i]]
+	nd <- newdat.m.pred.imp %>% dplyr::filter(Target==unique(df$Target))
+	plot <- df %>%
+		ggplot(aes(log10.mean.abs, shape=treat, RMSE))+
+		geom_point(aes(fill=interactor),size=2, col="black")+
+		facet_wrap(~treat, ncol = 4) +
+		labs(subtitle = unique(df$Target), tag=tag[i], x=expression('log'[10]~"(Mean interaction strength)")) +
+		scale_shape_manual(values=c(21,23))+
+		scale_color_manual(breaks = levels(ddrq1_importance$interactor),
+											 values = palette2, aesthetics = c("fill","color"))+
+		standard_theme() +
+		theme(legend.position = "none",
+					panel.spacing =  unit(0, "lines"),
+					axis.title = element_blank(),
+					strip.text.x = element_blank(),
+					legend.text = ggtext::element_markdown(),
+					plot.subtitle = ggtext::element_markdown()) +
+    guides(col=guide_legend(ncol=2))
+	
+	if(unique(df$target) %in% c("chlamydomonas_reinhardtii","euglena_gracilis")){
+		plot <- plot + 	
+			geom_ribbon(data=nd, aes(ymin=lower, ymax=upper, y=RMSE), alpha=0.2, col=NA)+
+			geom_line(data=nd, aes(log10.mean.abs,RMSE))
+	}
+	plot
+})
+
+m.pred.imp.plot.leg <- ddrq1_importance %>%
+	ggplot(aes(log10.mean.abs,RMSE,shape=treat))+
+	geom_point(aes(col=interactor,fill=interactor),size=2,)+
+	facet_wrap(~treat, ncol = 4) +
+	scale_color_manual(breaks = levels(ddrq1_importance$interactor),
+										 values = palette2, aesthetics = c("fill","color"))+
+	standard_theme() +
+	scale_shape_manual(values=c(21,23))+
+	theme(legend.position = "right",
+				panel.spacing =  unit(0, "lines"),
+				strip.text.x = element_blank(),
+				legend.text = ggtext::element_markdown(size = 11),
+				plot.subtitle = ggtext::element_markdown()) +
+	labs(shape="Temperature", fill= "Interactor/Predictor", col="Interactor/Predictor") +
+	geom_smooth(method = "lm")+
+	guides(col=guide_legend(ncol=2))
+
+m.pred.imp.plot.leg <- get_legend(m.pred.imp.plot.leg)
+
+ylab <- ggplot(data.frame(l = "    Forecast error (RMSE)", x = 1, y = 1)) +
+	geom_text(aes(x, y, label = l), angle = 90, size=6) +
+	theme_void() +
+	coord_cartesian(clip = "off")
+
+xlab <- ggplot(data.frame(x = 1, y = 1)) +
+	geom_text(aes(x, y), label = expression('log'[10]~"(Mean interaction strength)"), size=6) +
+	theme_void() +
+	coord_cartesian(clip = "off")
+
+plot4 <- ((ylab + ((Reduce("+", ddrq1_importance_list) + plot_layout(ncol = 2)) / xlab + plot_layout(heights = c(50,1))) + m.pred.imp.plot.leg + plot_layout(widths = c(2,80,20))))
+plot4
+```
+
+
+
+# Supplementary material: Analyses
+
+## Sensitivity analysis for the embedding dimension in the forecasts
+
+The following two code chunks redo the multiview EDM forecasting, but with E=2 and E=3 respectively. They are not run here, but their results are loaded in afterwards.
+
+```{r multiview_forecast_analysis_E2, message=FALSE, warning=FALSE, cache=TRUE, eval=FALSE}
+##############################################################
+## Species forecasting 
+
+# First some preparation:
+ks <- unique(round(exp(seq(log(0.8),log(100.4),length.out = 33))))
+
+possible_predictors <- c("bacteria","chlamydomonas_reinhardtii","colpidium_striatum",
+                         "dexiostomata_campylum", "didinium_nasutum",
+                         "euglena_gracilis","euplotes_daidaleos","paramecium_caudatum",
+                         "rotifer_sp","big_white_particle","dissolved_oxygen",
+                         "green_white_particle", "small_white_particle")
+ 
+dd2 <- dd2 %>% ungroup()
+set.seed(54)
+which=c(1,2,3,4,6,8,10,13)
+predictor_combinations <- predictor_combinator(possible_predictors, which=which)
+
+mvForecasts_list_E2 <- lapply(targets, function(target){
+  print(target)
+  df1 <- model_fitter_wrapper(whole.data = dd2, 
+                              predictor_combinations = predictor_combinations,
+                              target = target,
+                              num.clusters = detectCores()-2, 
+                              E = 2, max_lag = 3, k=ks)
+})
+
+mvForecasts_E2 <- do.call("rbind", mvForecasts_list_E2)
+
+predictors <- c(possible_predictors,"temperature")
+mvForecasts_E2$predictor_combination <- as.character(mvForecasts_E2$predictor_combination)
+temp <- matrix(F, nrow = nrow(mvForecasts_E2), ncol = length(predictors))
+colnames(temp) <- predictors
+mvForecasts_E2 <- cbind(mvForecasts_E2,temp)
+
+mvForecasts_E2 <- as.data.frame(t(apply(mvForecasts_E2, 1, function(row) { 
+  str <- unlist(strsplit(row["predictor_combination"], " "))
+  row[str] <- T
+  row
+})))
+
+mvForecasts_E2$num_pred <- as.numeric(mvForecasts_E2$num_pred)
+mvForecasts_E2$num_pred_without_temp <- as.numeric(mvForecasts_E2$num_pred_without_temp)
+mvForecasts_E2$RMSE <- as.numeric(mvForecasts_E2$RMSE)
+mvForecasts_E2$k <- as.numeric(mvForecasts_E2$k)
+for(i in predictors){  mvForecasts_E2[,i] <- as.logical(mvForecasts_E2[,i])}
+
+save(mvForecasts_E2, file = here("Data/Multiview_forecast_data/mvForecasts_E2.RData"))
+```
+
+
+```{r multiview_forecast_analysis_E4, message=FALSE, warning=FALSE, cache=TRUE, eval=FALSE}
+##############################################################
+## Species forecasting 
+
+# First some preparation:
+ks <- unique(round(exp(seq(log(0.8),log(100.4),length.out = 33))))
+
+possible_predictors <- c("bacteria","chlamydomonas_reinhardtii","colpidium_striatum",
+                         "dexiostomata_campylum", "didinium_nasutum",
+                         "euglena_gracilis","euplotes_daidaleos","paramecium_caudatum",
+                         "rotifer_sp","big_white_particle","dissolved_oxygen",
+                         "green_white_particle", "small_white_particle")
+ 
+dd2 <- dd2 %>% ungroup()
+set.seed(54)
+which=c(1,2,3,4,6,8,10,13)
+predictor_combinations <- predictor_combinator(possible_predictors, which=which)
+
+mvForecasts_list_E4 <- lapply(targets, function(target){
+  df1 <- model_fitter_wrapper(whole.data = dd2, 
+                              predictor_combinations = predictor_combinations,
+                              target = target,
+                              num.clusters = detectCores()-2, 
+                              E = 4, max_lag = 3, k=ks)
+})
+
+mvForecasts_E4 <- do.call("rbind", mvForecasts_list_E4)
+
+predictors <- c(possible_predictors,"temperature")
+mvForecasts_E4$predictor_combination <- as.character(mvForecasts_E4$predictor_combination)
+temp <- matrix(F, nrow = nrow(mvForecasts_E4), ncol = length(predictors))
+colnames(temp) <- predictors
+mvForecasts_E4 <- cbind(mvForecasts_E4,temp)
+
+mvForecasts_E4 <- as.data.frame(t(apply(mvForecasts_E4, 1, function(row) { 
+  str <- unlist(strsplit(row["predictor_combination"], " "))
+  row[str] <- T
+  row
+})))
+
+mvForecasts_E4$num_pred <- as.numeric(mvForecasts_E4$num_pred)
+mvForecasts_E4$num_pred_without_temp <- as.numeric(mvForecasts_E4$num_pred_without_temp)
+mvForecasts_E4$RMSE <- as.numeric(mvForecasts_E4$RMSE)
+mvForecasts_E4$k <- as.numeric(mvForecasts_E4$k)
+for(i in predictors){  mvForecasts_E4[,i] <- as.logical(mvForecasts_E4[,i])}
+
+save(mvForecasts_E4, file = here("Data/Multiview_forecast_data/mvForecasts_E4.RData"))
+```
+
+
+```{r E_sensitivity_plot_prep, message=FALSE, cache=TRUE, warning=FALSE}
+load(here("Data/Multiview_forecast_data/mvForecasts_E2.RData"))
+load(here("Data/Multiview_forecast_data/mvForecasts_E4.RData"))
+
+load(here("Data/Multiview_forecast_data/mvForecasts_interactorsAsPredictors_E2.RData")) # done previously
+load(here("Data/Multiview_forecast_data/mvForecasts_interactorsAsPredictors_E4.RData")) # done previously
+
+mvForecasts_interactorsAsPredictors_E2$E <- 2
+mvForecasts_interactorsAsPredictors_E4$E <- 4
+
+
+mvForecasts_E2$E <- 2
+mvForecasts_E4$E <- 4
+
+mvForecast <- full_join(mvForecasts_E2,mvForecasts_E4)
+
+mvForecast$temperature_included <- as.logical(mvForecast$temperature_included)
+mvForecast$target_excluded <- as.logical(mvForecast$target_excluded)
+mvForecast <- full_join(mvForecast, mvForecasts_interactorsAsPredictors_E2)
+mvForecast <- full_join(mvForecast, mvForecasts_interactorsAsPredictors_E4)
+mvForecast <- mvForecast %>%
+	na.omit() %>%
+	group_by(ID, treat, Target,E) %>%
+	mutate(best_rmse_bool = RMSE==min(RMSE),
+				 min_rmse = min(RMSE)) %>%
+	mutate(RMSE_equi = case_when(abs(RMSE-min_rmse)/((RMSE+min_rmse)/2) <= 0.01 ~ T,
+															 abs(RMSE-min_rmse)/((RMSE+min_rmse)/2) > 0.01 ~ F))
+
+mvForecast_best_allEs <- mvForecast %>% 
+	dplyr::filter(RMSE_equi==T) %>%
+	group_by(ID, treat, Target, E) %>%
+	slice_min(num_pred,n=1) %>%
+	slice_min(RMSE,n=1) %>% 
+	sample_n(1)
+
+mvForecast_best_allEs <- full_join(mvForecast_best_allEs, dd_smap_params_abs) 
+mvForecast_best_allEs$Target <- label[mvForecast_best_allEs$Target]
+
+mvForecast_best_allEs <- ddrq1_best_suppl %>%
+	mutate(E=3) %>%
+	full_join(mvForecast_best_allEs)
+
+
+
+mvForecast_best_allEs$Treat <- ifelse(mvForecast_best_allEs$treat=="const",
+														 "Constant temperature","Fluctuating temperature")
+
+mvForecast_best_allEs$E_char <- paste("E =", mvForecast_best_allEs$E)
+
+
+rm(mvForecasts_interactorsAsPredictors, mvForecasts_interactorsAsPredictors_E4, mvForecasts_interactorsAsPredictors_E2)
+
+#--------------------------------------
+
+rq1_list <- rq1_fct(dd_smap, mvForecasts_E2)
+ddrq1_fig1_E2 <- rq1_list[[1]]
+newdat_E2 <- rq1_list[[2]]
+tab.rq1.E2 <- rq1_list[[3]]
+newdat_E2$E = 2
+ddrq1_fig1_E2$E = 2
+tab.rq1.E2 <- cbind(E=2,tab.rq1.E2)
+
+rq1_list <- rq1_fct(dd_smap, mvForecasts_E4)
+ddrq1_fig1_E4 <- rq1_list[[1]]
+newdat_E4 <-  rq1_list[[2]]
+tab.rq1.E4 <- rq1_list[[3]]
+newdat_E4$E = 4
+ddrq1_fig1_E4$E = 4
+tab.rq1.E4 <- cbind(E=4,tab.rq1.E4)
+
+ddrq1_fig1_allEs <- full_join(full_join(ddrq1_fig1_E2,ddrq1_fig1_E4),ddrq1_treat_14_theta5)
+ddrq1_fig1_allEs$E <- ifelse(is.na(ddrq1_fig1_allEs$E),3,ddrq1_fig1_allEs$E)
+newdat_allEs <- full_join(full_join(newdat_E2,newdat_E4),newdat_theta5)
+newdat_allEs$E <- ifelse(is.na(newdat_allEs$E),3,newdat_allEs$E)
+```
+
+```{r fig1_allEs_prep2, fig.width=13, fig.height=6.5, out.width="95%", cache=TRUE, message=FALSE}
+ddrq1_fig1_allEs$treat <- ifelse(ddrq1_fig1_allEs$treat %in%  c("const","Constant"), "Constant","Fluctuating")
+ddrq1_fig1_allEs$Target2 <- label[ddrq1_fig1_allEs$Target]
+
+ddrq1_fig1_allEs$E_char <- paste("E =", ddrq1_fig1_allEs$E)
+newdat_allEs$E_char <- paste("E =", newdat_allEs$E)
+
+plot_leg_allEs <-
+	ddrq1_fig1_allEs %>%
+  ggplot(aes(count,RMSE, group=E_char, shape=treat, col=E_char, fill=E_char))+
+  geom_point(size=2.5, alpha=0.33) +
+	scale_shape_manual(values=c(21,23))+
+	scale_fill_brewer(palette = "Dark2", aesthetics = c("fill","col"))+
+	standard_theme()+
+	theme(legend.position = "right") +
+	labs(shape="Temperature", fill= "", col="") 
+
+plot1a_allEs <- ddrq1_fig1_allEs %>%
+  ggplot(aes(count,RMSE, group=E_char, shape=treat, col=E_char, fill=E_char))+
+  geom_line(data=newdat_allEs %>% dplyr::filter(model=="count"))+
+  geom_ribbon(data=newdat_allEs %>% dplyr::filter(model=="count"), aes(ymax=lower.count,ymin=upper.count), alpha=0.2, col=NA) +
+  geom_point(size=2.5, alpha=0.33) +
+	scale_shape_manual(values=c(21,23))+
+	scale_fill_brewer(palette = "Dark2", aesthetics = c("fill","col"))+
+  standard_theme()+
+  facet_wrap(~treat)+
+	theme(legend.position = "none",
+				panel.spacing =  unit(0, "lines"),
+				strip.text.x = element_blank()) +
+	labs(x=expression("Number of interactions"~italic(N[T])), y="Forecast error (RMSE)", tag = "A")
+
+plot1b_allEs <- ddrq1_fig1_allEs %>%
+  ggplot(aes(mean_mean_abs,RMSE, group=E_char, shape=treat, col=E_char, fill=E_char))+
+  geom_line(data=newdat_allEs %>% dplyr::filter(model=="mean_mean_abs"))+
+  geom_ribbon(data=newdat_allEs %>% dplyr::filter(model=="mean_mean_abs"), aes(ymax=lower.mean_mean_abs,ymin=upper.mean_mean_abs), alpha=0.2, col=NA) +
+  geom_point(size=2.5, alpha=0.33) +
+	scale_shape_manual(values=c(21,23))+
+	scale_fill_brewer(palette = "Dark2", aesthetics = c("fill","col"))+
+  standard_theme()+
+  facet_wrap(~treat)+
+	theme(legend.position = "none",
+				panel.spacing =  unit(0, "lines"),
+				strip.text.x = element_blank()) +
+	labs(x=expression("Mean interaction strength"~italic(mu["T"])), y="Forecast error (RMSE)", tag = "B")
+
+ddrq1_best_suppl$RMSE_E2 <- unlist(mvForecast_best_allEs[mvForecast_best_allEs$E==2,"RMSE"])
+ddrq1_best_suppl$RMSE_E4 <- unlist(mvForecast_best_allEs[mvForecast_best_allEs$E==4,"RMSE"])
+
+ddrq1_best_suppl_E234 <- ddrq1_best_suppl %>% pivot_longer(cols = c("RMSE_E2","RMSE_E4")) %>%
+  mutate(name=ifelse(name=="RMSE_E2","Best multiview EDM with E=2","Best multiview EDM with E=4")) 
+  
+cols  <- brewer.pal(3,"Dark2")
+
+plot1c_allEs <-
+  ddrq1_best_suppl_E234 %>%
+  ggplot(aes(RMSE, value, col=name, fill=name, shape=treat))+
+  geom_abline(slope = 1, intercept = 0) +
+  geom_point(size=2.5, alpha=0.33) +
+  scale_fill_manual(values = cols[c(1,3)], aesthetics = c("fill","col"))+
+	scale_shape_manual(values=c(21,23))+
+  standard_theme()+
+  facet_wrap(~treat) +
+  theme(legend.position = "none",
+        panel.spacing =  unit(0, "lines"),
+        strip.text.x = element_blank()) +
+	labs(x="Lowest RMSE of model with respective E", y="Lowest RMSE of model with E=3", tag = "C")
+  
+
+plot_leg_allEs <- get_legend(plot_leg_allEs)
+
+plot1_allEs <- plot1a_allEs+plot1b_allEs+plot1c_allEs+ plot_leg_allEs + plot_layout(ncol = 2)
+rm(plot1a_allEs, plot1b_allEs, plot1c_allEs, plot_leg_allEs)
+```
+
+
+## Species interactions robustness analyses
+
+### Sensitivity analysis for $\theta$
+
+```{r smap_models_sensitivity, message=FALSE, warning=FALSE, cache=TRUE}
+load(here("Data/CCM_analysis_data/pairwise_ccm_df_list_transf_resid.RData")) # loaded again, same as above
+pairwise_ccm_df <- do.call("rbind",pairwise_ccm_df_list)
+
+significant_pairwise_ccm_df <- pairwise_ccm_df %>%
+	dplyr::filter(significances<0.05, rho >0)
+ 
+list_smap <- lapply(targets, function(x){
+  SMapInteractions(Target = x, num.clusters.target = 1, 
+                   num.clusters.CV = NULL, method = "SMap", 
+                   data = dd2, long_format = T, theta = 3, 
+                   ccm_df = significant_pairwise_ccm_df)
+})
+
+dd_smap3 <- do.call("rbind", list_smap) %>%
+  dplyr::filter(!(treat=="const" & interactor=="temperature"),
+                Interaction!="C0")
+
+list_smap <- lapply(targets, function(x){
+  SMapInteractions(Target = x, num.clusters.target = 1, 
+                   num.clusters.CV = NULL, method = "SMap", 
+                   data = dd2, long_format = T, theta = 7, 
+                   ccm_df = significant_pairwise_ccm_df)
+})
+
+dd_smap7 <- do.call("rbind", list_smap) %>%
+  dplyr::filter(!(treat=="const" & interactor=="temperature"),
+                Interaction!="C0")
+
+#### theta = 3
+rq1_list_theta3 <- rq1_fct(dd_smap3, ddrq1)
+
+ddrq1_treat_14_theta3 <- rq1_list_theta3[[1]]
+newdat_theta3 <- rq1_list_theta3[[2]]
+tab.rq1.theta3 <- rq1_list_theta3[[3]]
+newdat_theta3$theta = 3
+ddrq1_treat_14_theta3$theta = 3
+tab.rq1.theta3 <- cbind(theta=3,tab.rq1.theta3)
+
+#### theta = 7
+
+rq1_list_theta7 <- rq1_fct(dd_smap7, ddrq1)
+
+ddrq1_treat_14_theta7 <- rq1_list_theta7[[1]]
+newdat_theta7 <- rq1_list_theta7[[2]]
+tab.rq1.theta7 <- rq1_list_theta7[[3]]
+newdat_theta7$theta = 7
+ddrq1_treat_14_theta7$theta = 7
+tab.rq1.theta7 <- cbind(theta=7,tab.rq1.theta7)
+
+rm(dd_smap3, dd_smap7, list_smap, rq1_list_theta3, rq1_list_theta7)
+```
+
+```{r smap_models_sensitivity2, message=FALSE, warning=FALSE, cache=TRUE}
+ddrq1_treat_14_thetas <- rbind(ddrq1_treat_14_theta3, ddrq1_treat_14_theta5, ddrq1_treat_14_theta7)
+ddrq1_treat_14_thetas$theta <- as.factor(ddrq1_treat_14_thetas$theta)
+ddrq1_treat_14_thetas$treat <- ifelse(ddrq1_treat_14_thetas$treat %in% c("const","Constant"),
+																			"Constant","Fluctuating")
+
+newdat_thetas <- rbind(newdat_theta3, newdat_theta5, newdat_theta7)
+newdat_thetas$theta <- as.factor(newdat_thetas$theta)
+
+ddrq1_treat_14_thetas$theta2 <- ifelse(ddrq1_treat_14_thetas$theta==3, "Theta = 3",
+																			 ifelse(ddrq1_treat_14_thetas$theta==5, "Theta = 5","Theta = 7"))
+newdat_thetas$theta2 <- ifelse(newdat_thetas$theta==3, "Theta = 3",
+																			 ifelse(newdat_thetas$theta==5, "Theta = 5","Theta = 7"))
+
+rm(ddrq1_treat_14_theta3, ddrq1_treat_14_theta7, newdat_theta3, newdat_theta5, newdat_theta7)
+
+thetaplot1 <- ddrq1_treat_14_thetas %>%
+  ggplot(aes(mean_mean_abs,RMSE, shape=treat, col=theta2, fill=theta2))+
+  facet_wrap(~treat)+
+  geom_line(data=newdat_thetas %>% dplyr::filter(model=="mean_mean_abs")) +
+  geom_ribbon(data=newdat_thetas %>% dplyr::filter(model=="mean_mean_abs"),
+  						aes(ymax=lower.mean_mean_abs,ymin=upper.mean_mean_abs), alpha=0.2, col=NA) +
+  geom_point(size=1.2, alpha=0.33) +
+	scale_shape_manual(values=c(21,23))+
+	scale_fill_brewer(palette = "Dark2", aesthetics = c("col","fill"))+
+  standard_theme()+
+	theme(legend.position = "none",
+				panel.spacing =  unit(0, "lines"),
+				strip.text.x = element_blank(),
+				plot.subtitle = ggtext::element_markdown()) +
+	labs(x="Mean interaction strength", y="RMSE", tag = "A")
+
+thetaplot2 <- ddrq1_treat_14_thetas %>%
+  ggplot(aes(count, mean_mean_abs, shape=treat, col=theta2, fill=theta2))+
+  geom_line(data=newdat_thetas %>% dplyr::filter(model=="corr"))+
+  geom_ribbon(data=newdat_thetas %>% dplyr::filter(model=="corr"), aes(ymax=lower.corr,ymin=upper.corr), alpha=0.2, col=NA) +
+  geom_point(size=1.2, alpha=0.33) +
+	scale_shape_manual(values=c(21,23))+
+	scale_fill_brewer(palette = "Dark2", aesthetics = c("col","fill"))+
+	standard_theme()+
+	theme(legend.position = "none",
+				panel.spacing =  unit(0, "lines"),
+				strip.text.x = element_blank(),
+				plot.subtitle = ggtext::element_markdown()) +
+	facet_wrap(~treat) + 
+	labs(x="Number of interactions", y="Mean interaction strength", tag = "B")
+
+thetaplot3 <- ddrq1_treat_14_thetas %>%
+  ggplot(aes(sum_mean_abs,RMSE, shape=treat, col=theta2, fill=theta2))+
+  geom_line(data=newdat_thetas %>% dplyr::filter(model=="iso"))+
+  geom_ribbon(data=newdat_thetas %>% dplyr::filter(model=="iso"), aes(ymax=lower.iso,ymin=upper.iso), alpha=0.2, col=NA) +
+  geom_point(size=1.2, alpha=0.33) +
+	scale_shape_manual(values=c(21,23))+
+	scale_fill_brewer(palette = "Dark2", aesthetics = c("col","fill"))+
+	standard_theme()+
+	theme(legend.position = "right",
+				panel.spacing =  unit(0, "lines"),
+				strip.text.x = element_blank(),
+				plot.subtitle = ggtext::element_markdown()) +
+	facet_wrap(~treat)+
+	labs(x="Sum of interaction strengths", y="RMSE", tag = "C",
+	     shape="Temperature", col="", fill="")
+```
+
+
+### Using Regularized S-map
+
+The following code chunk is not run. The results are loaded in after it.
+
+```{r RegSmap, message=FALSE, warning=FALSE, cache=TRUE, eval=FALSE}
+##############################################################
+## Species interactions
+
+# Load number of interactions
+load(here("Data/CCM_analysis_data/pairwise_ccm_df_list_transf_resid.RData")) 
+pairwise_ccm_df <- do.call("rbind",pairwise_ccm_df_list)
+
+significant_pairwise_ccm_df <- pairwise_ccm_df %>%
+	dplyr::filter(significances<0.05, rho >0)
+
+
+logspace <- function(d1, d2, n) exp(log(10)*seq(d1, d2, length.out=n)) 
+thetas <- c(0.01, 0.1, 0.3, 0.5, 0.75, 1, 1.5, 2, 3, 4, 5, 6, 7, 8, 9)
+
+### Tikhonov (alpha=1)
+
+grid <- expand.grid(tht=thetas,
+                    lambda=logspace(-3,0,30),
+                    alpha=1)
+
+# calculation of interactions 
+list_Regsmap <- lapply(targets, function(x){
+  SMapInteractions(Target = x, num.clusters.target = 1, 
+                   num.clusters.CV = detectCores()-1, 
+                   data = dd2, 
+                   long_format = T, method = "RegSMap", 
+                   grid = grid,
+                   ccm_df = significant_pairwise_ccm_df, 
+                   RegressionType = "ELNET_fit", 
+                   Regression.Kernel = "Exponential.Kernel")
+})
+
+dd_Regsmap_tikhonov <- do.call("rbind", list_Regsmap) %>%
+  dplyr::filter(!(treat=="const" & interactor=="temperature"),
+                Interaction!="C0")
+
+dd_Regsmap_tikhonov$method <- "tikhonov"
+
+### ELNET with alpha=0.9
+
+grid <- expand.grid(tht=thetas,
+                    lambda=logspace(-3,0,30),
+                    alpha=0.9)
+
+# calculation of interactions 
+list_Regsmap <- lapply(targets, function(x){
+  SMapInteractions(Target = x, num.clusters.target = 1, 
+                   num.clusters.CV = detectCores()-1, 
+                   data = dd2, 
+                   long_format = T, method = "RegSMap", 
+                   grid = grid,
+                   ccm_df = significant_pairwise_ccm_df, 
+                   RegressionType = "ELNET_fit", 
+                   Regression.Kernel = "Exponential.Kernel")
+})
+
+dd_Regsmap_ELNET0.9 <- do.call("rbind", list_Regsmap) %>%
+  dplyr::filter(!(treat=="const" & interactor=="temperature"),
+                Interaction!="C0")
+
+dd_Regsmap_ELNET0.9$method <- "ELNET0.9"
+
+
+### Ridge regression (no alpha)
+
+grid <- expand.grid(tht=thetas,
+                    lambda=logspace(-3,0,30),
+                    alpha=1)
+
+# calculation of interactions 
+list_Regsmap <- lapply(targets, function(x){
+  SMapInteractions(Target = x, num.clusters.target = 1, 
+                   num.clusters.CV = detectCores()-1, 
+                   data = dd2, 
+                   long_format = T, method = "RegSMap", 
+                   grid = grid,
+                   ccm_df = significant_pairwise_ccm_df, 
+                   RegressionType = "ridge_fit", 
+                   Regression.Kernel = "Exponential.Kernel")
+})
+
+dd_Regsmap_ridge <- do.call("rbind", list_Regsmap) %>%
+  dplyr::filter(!(treat=="const" & interactor=="temperature"),
+                Interaction!="C0")
+
+dd_Regsmap_ridge$method <- "ridge"
+
+
+save(dd_Regsmap_tikhonov, file = here("Data/Smap_interaction_data/dd_Regsmap_tikhonov.RData"))
+save(dd_Regsmap_ELNET0.9, file = here("Data/Smap_interaction_data/dd_Regsmap_ELNET0.9.RData"))
+save(dd_Regsmap_ridge, file = here("Data/Smap_interaction_data/dd_Regsmap_ridge.RData"))
+```
+
+```{r fig1_with_regSmap, warning=FALSE, cache=TRUE, message=FALSE, fig.width=9, fig.height=6.5, out.width="95%"}
+load(here("Data/Smap_interaction_data/dd_Regsmap_tikhonov.RData"))
+load(here("Data/Smap_interaction_data/dd_Regsmap_ELNET0.9.RData"))
+load(here("Data/Smap_interaction_data/dd_Regsmap_ridge.RData"))
+
+cmult <- 1.96
+
+## Reg: ridge regression
+rq1_list_ridge <- rq1_fct(dd_Regsmap_ridge, ddrq1)
+ddrq1_treat_14_ridge <- rq1_list_ridge[[1]]
+newdat_ridge <- rq1_list_ridge[[2]]
+tab.rq1.ridge <- rq1_list_ridge[[3]]
+dd_smap_params_abs_ridge <- rq1_list_ridge[[4]] 
+ddrq1_treat_14_ridge$regularization <- "Ridge regression"
+newdat_ridge$regularization <- "Ridge regression"
+
+## Reg: tikhonov
+rq1_list_tikhonov <- rq1_fct(dd_Regsmap_tikhonov, ddrq1)
+ddrq1_treat_14_tikhonov <- rq1_list_tikhonov[[1]]
+newdat_tikhonov <- rq1_list_tikhonov[[2]]
+tab.rq1.tikhonov <- rq1_list_tikhonov[[3]]
+dd_smap_params_abs_tikhonov <- rq1_list_tikhonov[[4]]
+ddrq1_treat_14_tikhonov$regularization <- "Tikhonov"
+newdat_tikhonov$regularization <- "Tikhonov"
+
+## Reg: elnet 0.9
+rq1_list_ELNET0.9 <- rq1_fct(dd_Regsmap_ELNET0.9, ddrq1)
+ddrq1_treat_14_ELNET0.9 <- rq1_list_ELNET0.9[[1]]
+newdat_ELNET0.9 <- rq1_list_ELNET0.9[[2]]
+tab.rq1.ELNET0.9 <- rq1_list_ELNET0.9[[3]]
+dd_smap_params_abs_ELNET0.9 <- rq1_list_ELNET0.9[[4]]
+ddrq1_treat_14_ELNET0.9$regularization <- "ELNET0.9"
+newdat_ELNET0.9$regularization <- "ELNET0.9"
+
+ddrq1_treat_14_regsmap <- rbind(ddrq1_treat_14_ELNET0.9,
+                                ddrq1_treat_14_tikhonov,
+                                ddrq1_treat_14_ridge)
+newdat_regsmap <- rbind(newdat_ELNET0.9,
+                        newdat_tikhonov,
+                        newdat_ridge)
+
+ddrq1_treat_14_regsmap$treat <- ifelse(ddrq1_treat_14_regsmap$treat=="const","Constant","Fluctuating")
+ddrq1_treat_14_regsmap$Target2 <- label[ddrq1_treat_14_regsmap$Target]
+
+plot_leg_regsmap <-
+	ddrq1_treat_14_regsmap %>%
+	ggplot(aes(mean_mean_abs,RMSE, group=treat, shape=treat, fill=regularization, col=regularization))+
+	geom_point(size=2.5)+
+	scale_shape_manual(values=c(21,23))+
+	scale_fill_brewer(palette = "Dark2", aesthetics = c("fill","col"))+
+	standard_theme()+
+	theme(legend.position = "right", legend.box="vertical",
+				legend.text = ggtext::element_markdown()) +
+	labs(shape="Temperature", fill= "Regularization", col="Regularization") +
+	guides(fill=guide_legend(nrow=8,byrow=TRUE), shape=guide_legend(nrow=2,byrow=TRUE))
+
+plotregsmap1 <- ddrq1_treat_14_regsmap %>%
+  ggplot(aes(mean_mean_abs,RMSE, shape=treat, fill=regularization, col=regularization))+
+  geom_line(data=newdat_regsmap %>% dplyr::filter(model=="mean_mean_abs"))+
+  geom_ribbon(data=newdat_regsmap %>% dplyr::filter(model=="mean_mean_abs"),
+              aes(ymax=lower.mean_mean_abs,ymin=upper.mean_mean_abs), alpha=0.2, col=NA) +
+  geom_point(size=2.5, alpha=0.33)+
+	scale_shape_manual(values=c(21,23))+
+	scale_fill_brewer(palette = "Dark2", aesthetics = c("fill","col"))+
+  standard_theme()+
+  facet_wrap(~treat)+
+	theme(legend.position = "none",
+				panel.spacing =  unit(0, "lines"),
+				strip.text.x = element_blank(),
+				plot.subtitle = ggtext::element_markdown()) +
+	labs(x=expression("Mean interaction strength"~italic(mu["T"])), y="Forecast error (RMSE)", tag = "A")
+
+plotregsmap2 <- ddrq1_treat_14_regsmap %>%
+  ggplot(aes(count, mean_mean_abs, shape=treat, fill=regularization, col=regularization))+
+  geom_line(data=newdat_regsmap %>% dplyr::filter(model=="corr"))+
+  geom_ribbon(data=newdat_regsmap %>% dplyr::filter(model=="corr"), 
+              aes(ymax=lower.corr,ymin=upper.corr), alpha=0.2, col=NA) +
+  geom_point(size=2.5, alpha=0.33)+
+	scale_shape_manual(values=c(21,23))+
+	scale_fill_brewer(palette = "Dark2", aesthetics = c("fill","col"))+
+	standard_theme()+
+	theme(legend.position = "none",
+				panel.spacing =  unit(0, "lines"),
+				strip.text.x = element_blank(),
+				plot.subtitle = ggtext::element_markdown()) +
+	facet_wrap(~treat) +
+	labs(x=expression("Number of interactions"~italic(N[T])),
+			 y=expression("Mean interaction strength"~italic(mu["T"])), tag = "B")
+
+plot_leg_regsmap <- get_legend(plot_leg_regsmap)
+```
+
+## General robustness analyses
+
+### Excluding Euglena gracilis
+
+```{r smap_models_euglena, message=FALSE, warning=FALSE, cache=TRUE}
+load(here("Data/CCM_analysis_data/pairwise_ccm_df_list_transf_resid.RData")) # loaded again, see above
+pairwise_ccm_df <- do.call("rbind",pairwise_ccm_df_list) %>%
+	dplyr::filter(target!="euglena_gracilis")
+
+significant_pairwise_ccm_df <- pairwise_ccm_df %>%
+	dplyr::filter(significances<0.05, rho >0)
+ 
+list_smap <- lapply(targets, function(x){
+  SMapInteractions(Target = x, num.clusters.target = 1, 
+                   num.clusters.CV = NULL, method = "SMap", 
+                   data = dd2, long_format = T, theta = 5, 
+                   ccm_df = significant_pairwise_ccm_df)
+})
+
+dd_smap_euglena <- do.call("rbind", list_smap) %>%
+  dplyr::filter(!(treat=="const" & interactor=="temperature"),
+                Interaction!="C0")
+
+
+rq1_list_euglena <- rq1_fct(dd_smap = dd_smap_euglena %>% dplyr::filter(target!="euglena_gracilis"), 
+														ddrq1 = ddrq1 %>% dplyr::filter(Target!="euglena_gracilis"),
+														permutation_entropies.dd = permutation_entropies %>% dplyr::filter(Target!="euglena_gracilis"),
+														cv.dd = cv %>% dplyr::filter(Target!="euglena_gracilis"))
+
+ddrq1_treat_14_euglena <- rq1_list_euglena[[1]]
+newdat_euglena <- rq1_list_euglena[[2]]
+tab.rq1.euglena <- rq1_list_euglena[[3]]
+ddrq1_treat_14_euglena$treat <- ifelse(ddrq1_treat_14_euglena$treat=="const","Constant","Fluctuating")
+ddrq1_treat_14_euglena$Target2 <- label[ddrq1_treat_14_euglena$Target]
+newdat_euglena$robust <- "Without euglena"
+ddrq1_treat_14_euglena$robust <- "Without euglena"
+
+tab.rq1.euglena <- tab.rq1.euglena[1:15,]
+
+rm(dd_smap_euglena, list_smap, rq1_model_fcts_list)
+```
+
+
+### Estimating all possible species interactions
+
+```{r smap_models_all_interactors, message=FALSE, warning=FALSE, cache=TRUE}
+load(here("Data/CCM_analysis_data/pairwise_ccm_df_list_transf_resid.RData")) # loaded again, same as above
+pairwise_ccm_df <- do.call("rbind",pairwise_ccm_df_list)
+
+list_smap <- lapply(targets, function(x){
+    SMapInteractions(Target = x, num.clusters.target = 1, 
+                   num.clusters.CV = NULL, method = "SMap", 
+                   data = dd2, long_format = T, theta = 5, 
+                   ccm_df = pairwise_ccm_df)
+})
+
+dd_smap_all_interaction <- do.call("rbind", list_smap) %>%
+  dplyr::filter(!(treat=="const" & interactor=="temperature"),
+                Interaction!="C0")
+
+rq1_list_all_interactions <- rq1_fct(dd_smap_all_interaction, ddrq1, count=F, table=F, corr=F)
+
+ddrq1_treat_all_interactions  <- rq1_list_all_interactions[[1]]
+newdat_all_interactions  <- rq1_list_all_interactions[[2]]
+
+ddrq1_treat_all_interactions$treat <- ifelse(ddrq1_treat_all_interactions$treat=="const","Constant","Fluctuating")
+ddrq1_treat_all_interactions$Target2 <- label[ddrq1_treat_all_interactions$Target]
+newdat_all_interactions$robust <- "All interactions considered"
+ddrq1_treat_all_interactions$robust <- "All interactions considered"
+
+Covariates <- c("Fluctuating temperature","Interaction","Bottle ID")
+m.mean_mean_abs <- lmer(RMSE~mean_mean_abs*treat + (1|ID), data = ddrq1_treat_all_interactions)
+tab_all_interactions <- data.frame(Response = rep(c("RMSE"), each=5),
+																	 Covariate = c("Intercept","Mean interaction strength",Covariates),
+																	 Type = c("Fixed","Fixed","Fixed","Fixed","Std. Dev."),
+																	 Coefficient = c(fixef(m.mean_mean_abs),as.data.frame(VarCorr(m.mean_mean_abs))$sdcor[1]),
+																	 Std.err = c(summary(m.mean_mean_abs)$coef[, 2, drop = FALSE],NA),
+																	 Test = c(rep("\\textit{t}",4),"$\\chi^2$"),
+																	 Test.value = c(summary(m.mean_mean_abs)$coef[, 4, drop = FALSE],lmerTest::rand(m.mean_mean_abs)$LRT[2]),
+																	 p.value = c(summary(m.mean_mean_abs)$coef[, 5, drop = FALSE],lmerTest::rand(m.mean_mean_abs)$`Pr(>Chisq)`[2]))
+rownames(tab_all_interactions) <- 1:nrow(tab_all_interactions)
+
+rm(dd_smap_all_interaction, list_smap, rq1_list_all_interactions)
+```
+
+
+### Partitioning the data for forecasts and species interactions
+
+The following 2 code chunks are not run. Instead the results are loaded in the chunk after.
+
+```{r multiview_forecast_analysis_partitioned, message=FALSE, warning=FALSE, cache=TRUE, eval=FALSE}
+possible_predictors <- c("bacteria","chlamydomonas_reinhardtii","colpidium_striatum",
+                         "dexiostomata_campylum", "didinium_nasutum",
+                         "euglena_gracilis","euplotes_daidaleos","paramecium_caudatum",
+                         "rotifer_sp","big_white_particle","dissolved_oxygen",
+                         "green_white_particle", "small_white_particle")
+
+predictor_combinations <- list(c(possible_predictors,"temperature"))
+
+ks <- unique(round(exp(seq(log(0.8),log(100.4),length.out = 33))))
+# ks <- 1:2
+
+lib <- "1 33"
+pred <- "34 66"
+
+ddrq1_partitioned_list <- lapply(targets, function(target){
+  df1 <- model_fitter_wrapper(whole.data = dd2, 
+                              predictor_combinations =  predictor_combinations,
+                              target = target,
+                              num.clusters = detectCores() - 1, 
+                              E = 3, max_lag = 3, k=ks, 
+  														lib = lib, pred = pred)
+})
+
+ddrq1_partitioned <- do.call("rbind", ddrq1_partitioned_list)
+
+predictors <- c(possible_predictors,"temperature")
+ddrq1_partitioned$predictor_combination <- as.character(ddrq1_partitioned$predictor_combination)
+temp <- matrix(F, nrow = nrow(ddrq1_partitioned), ncol = length(predictors))
+colnames(temp) <- predictors
+ddrq1_partitioned <- cbind(ddrq1_partitioned,temp)
+
+ddrq1_partitioned <- as.data.frame(t(apply(ddrq1_partitioned, 1, function(row) { 
+  str <- unlist(strsplit(row["predictor_combination"], " "))
+  row[str] <- T
+  row
+})))
+
+ddrq1_partitioned$num_pred <- as.numeric(ddrq1_partitioned$num_pred)
+ddrq1_partitioned$num_pred_without_temp <- as.numeric(ddrq1_partitioned$num_pred_without_temp)
+ddrq1_partitioned$RMSE <- as.numeric(ddrq1_partitioned$RMSE)
+ddrq1_partitioned$k <- as.numeric(ddrq1_partitioned$k)
+for(i in predictors){  ddrq1_partitioned[,i] <- as.logical(ddrq1_partitioned[,i])}
+
+save(ddrq1_partitioned, file = here("Data/Multiview_forecast_data/ddrq1_transf_resid_partitioned.RData"))
+```
+
+
+```{r interactors_used_as_predictors_partitioned, cache=TRUE, message=FALSE, eval=FALSE}
+##############################################################
+### trim (for partition)
+
+dd2_partitioned <- dd2 %>%
+  dplyr::group_by(ID) %>%
+  dplyr::slice(34:66)
+
+interactors <- colnames(dd2_partitioned[,-c(1:7)])
+var_pairs <- expand.grid(target=targets, interactors=interactors)
+
+dd2_dflist <- split(dd2_partitioned, dd2_partitioned$ID)
+
+pairwise_ccm_df_list <- mclapply(dd2_dflist, function(df){
+	dftemp <- df[,-c(1,3:7)]
+	Best_E_df <- apply(var_pairs,1, function(c){
+		best_E_fct_trimmed(dftemp,c[1],c[2])
+	})
+	
+	Best_E_df <- do.call("rbind",Best_E_df)
+	Best_E_df$ID <- unique(df$ID)
+	Best_E_df$treat <- unique(df$treat)
+	Best_E_df$treat2 <- unique(df$treat2)
+	Best_E_df$treat3 <- unique(df$treat3)
+	
+	rhos <- apply(Best_E_df, 1, function(r){
+		ccm_out <- CCM(dataFrame = dftemp, target = r[1], column = r[2],
+									 libSizes = "9 29 4", Tp = 0, E = as.numeric(r[3]), sample = 100)
+		rho <- ccm_out[6,3]
+		if(rho<0) return(data.frame(rho=rho,comment="negative"))
+		slope <- lm(ccm_out[,3] ~ seq(9,29,by = 4))$coefficients[2]
+		if(slope>=0) {return(data.frame(rho=rho,comment="converged"))
+		} else {return(data.frame(rho=rho,comment="not converged"))}
+	})
+	
+	Best_E_df <- cbind(Best_E_df,do.call("rbind",rhos))
+	
+	rho_df <- Best_E_df %>%
+		dplyr::filter(target %in% targets, comment=="converged")
+	
+	significances <- apply(rho_df, 1, function(r){
+		ts <- unlist(df[,as.character(r[2])])
+		# target <- r[2]
+		surr_interactor = SurrogateData(ts, method = "random_shuffle",
+																		num_surr = 1000, alpha = 3)
+		
+		rho_surr <- data.frame(interactor_rho = numeric(1000))
+		
+		interactor_data = as.data.frame(cbind(df$day, ts, surr_interactor))
+		names(interactor_data) = c("day", r[1], paste("T", as.character(seq(1, 1000)),	sep = ""))
+		
+		for (i in 1:1000) {
+			targetCol = paste("T", i, sep = "") 
+			ccm_out = CCM(dataFrame = interactor_data, E = as.numeric(r[3]), Tp = 0, columns = r[1],
+										target = targetCol, libSizes = "29 29 10", sample = 1)
+			col = paste(r[1], ":", targetCol, sep = "")
+			rho_surr$interactor_rho[i] = ccm_out[1, col]
+		}
+		1 - ecdf(rho_surr$interactor_rho)(as.numeric(r["rho"]))
+	})
+	
+	rho_df$significances <- significances
+	pairwise_ccm_df <- full_join(Best_E_df,rho_df)
+	pairwise_ccm_df
+}, mc.cores = detectCores()-2)
+
+save(pairwise_ccm_df_list, file = here("Data/CCM_analysis_data/pairwise_ccm_df_list_transf_resid_trimmed.RData"))
+```
+
+
+```{r multiview_forecast_analysis_partitioned_part2, message=FALSE, warning=FALSE, cache=TRUE}
+load(here("Data/Multiview_forecast_data/ddrq1_transf_resid_partitioned.RData")) 
+load(here("Data/CCM_analysis_data/pairwise_ccm_df_list_transf_resid_trimmed.RData")) 
+pairwise_ccm_df_trimmed <- do.call("rbind",pairwise_ccm_df_list)
+
+significant_pairwise_ccm_df_trimmed <- pairwise_ccm_df_trimmed %>%
+	dplyr::filter(significances<0.05, rho >0)
+
+# calculation of interactions 
+list_smap <- lapply(targets, function(x){
+      SMapInteractions(Target = x, num.clusters.target = 1, 
+                   num.clusters.CV = NULL, method = "SMap", 
+                   data = dd2, long_format = T, theta = 5, 
+                   ccm_df = significant_pairwise_ccm_df_trimmed)
+})
+
+dd_smap_trimmed <- do.call("rbind", list_smap) %>%
+  dplyr::filter(!(treat=="const" & interactor=="temperature"),
+                Interaction!="C0")
+
+significant_pairwise_ccm_df_trimmed$Target2 <- label[significant_pairwise_ccm_df_trimmed$target]
+
+num_int_plot2 <- significant_pairwise_ccm_df_trimmed %>%
+	na.omit() %>% 
+	ggplot(aes(ID, fill=Target2)) +
+	geom_bar(position = "identity")+
+	facet_wrap(~Target2, ncol = 4)+
+	standard_theme2() +
+	scale_fill_brewer(palette="Dark2")+
+	labs(x="Bottle ID", y="Number of interactions") +
+	theme(strip.text = ggtext::element_markdown(),
+				axis.text.x = element_text(angle = 90, vjust = 0.5, hjust=1))
+
+rq1_list_trimmed <- rq1_fct(dd_smap_trimmed, ddrq1_partitioned)
+ddrq1_treat_14_partitioned <- rq1_list_trimmed[[1]]
+newdat_partitioned <- rq1_list_trimmed[[2]]
+tab.rq1.partitioned <- rq1_list_trimmed[[3]]
+tab.rq1.partitioned <- tab.rq1.partitioned[1:15,]
+
+newdat_partitioned$robust <- "Partitioned data"
+ddrq1_treat_14_partitioned$robust <- "Partitioned data"
+ddrq1_treat_14_partitioned$treat <- ifelse(ddrq1_treat_14_partitioned$treat=="const","Constant","Fluctuating")
+
+rm(rq1_list_all_interactions, rq1_list_all_interactions, list_smap)
+```
+
+
+### Taking the mean of the absolute values of the mean interaction strengths
+
+```{r mean_abs_mean, message=FALSE, warning=FALSE, cache=TRUE}
+ddrq1_treat_14_theta5_mean_abs_mean <- ddrq1_treat_14_theta5
+ddrq1_treat_14_theta5_mean_abs_mean$mean_mean_abs <- ddrq1_treat_14_theta5_mean_abs_mean$mean_abs_mean
+
+rq1_list_mean_abs_mean <- rq1_model_fcts(ddrq1_treat_14_theta5_mean_abs_mean)
+newdat_mean_abs_mean  <- rq1_list_mean_abs_mean[[1]]
+tab_mean_abs_mean <- rq1_list_mean_abs_mean[[2]]
+tab_mean_abs_mean <- tab_mean_abs_mean[6:10,]
+tab_mean_abs_mean[2,2] <- "Mean(abs(mean(IS)))"
+
+ddrq1_treat_14_theta5_mean_abs_mean$treat <- ifelse(ddrq1_treat_14_theta5_mean_abs_mean$treat=="const","Constant","Fluctuating")
+ddrq1_treat_14_theta5_mean_abs_mean$Target2 <- label[ddrq1_treat_14_theta5_mean_abs_mean$Target]
+newdat_mean_abs_mean$robust <- "Mean(abs(mean(interaction TS)))"
+ddrq1_treat_14_theta5_mean_abs_mean$robust <- "Mean(abs(mean(interaction TS)))"
+
+rm(rq1_list_mean_abs_mean)
+```
+
+
+### Robustness analyses taken together
+
+```{r robust_plot_calc, message=FALSE, warning=FALSE, cache=TRUE}
+newdat_robust <- full_join(newdat_euglena, 
+                           full_join(newdat_all_interactions, 
+													 										full_join(newdat_partitioned, newdat_mean_abs_mean)))
+
+ddrq1_treat_14_euglena$temperature_included <- as.logical(ddrq1_treat_14_euglena$temperature_included)
+ddrq1_treat_14_euglena$target_excluded <- as.logical(ddrq1_treat_14_euglena$target_excluded)
+ddrq1_treat_all_interactions$temperature_included <- as.logical(ddrq1_treat_all_interactions$temperature_included)
+ddrq1_treat_all_interactions$target_excluded <- as.logical(ddrq1_treat_all_interactions$target_excluded)
+ddrq1_treat_14_partitioned$temperature_included <- as.logical(ddrq1_treat_14_partitioned$temperature_included)
+ddrq1_treat_14_partitioned$target_excluded <- as.logical(ddrq1_treat_14_partitioned$target_excluded)
+ddrq1_treat_14_theta5_mean_abs_mean$temperature_included <- as.logical(ddrq1_treat_14_theta5_mean_abs_mean$temperature_included)
+ddrq1_treat_14_theta5_mean_abs_mean$target_excluded <- as.logical(ddrq1_treat_14_theta5_mean_abs_mean$target_excluded)
+ddrq1_treat_14_robust <- rbind(ddrq1_treat_14_euglena, ddrq1_treat_all_interactions, ddrq1_treat_14_partitioned,ddrq1_treat_14_theta5_mean_abs_mean)
+
+rm(newdat_euglena,newdat_all_interactions,newdat_partitioned,newdat_mean_abs_mean,
+	 ddrq1_treat_14_euglena,ddrq1_treat_all_interactions,ddrq1_treat_14_partitioned,ddrq1_treat_14_theta5_mean_abs_mean)
+
+ddrq1_treat_14_robust$robust <- as.factor(ddrq1_treat_14_robust$robust)
+newdat_robust$robust <- as.factor(newdat_robust$robust)
+robust_levels <- levels(ddrq1_treat_14_robust$robust)
+# names(robust_levels) <- c('#e41a1c','#377eb8','#4daf4a','#984ea3','#ff7f00')
+names(robust_levels) <- brewer.pal(4,"Dark2")
+
+tab_mean_abs_mean <- cbind(Robust="Mean(abs(mean(IS)))",tab_mean_abs_mean)
+tab.rq1.partitioned <- cbind(Robust="Partitioned data",tab.rq1.partitioned)
+tab_all_interactions <- cbind(Robust="All interactions",tab_all_interactions)
+tab_all_interactions$Response <- "RMSE\n"
+tab.rq1.euglena <- cbind(Robust="Without Euglena",tab.rq1.euglena)
+
+tab.robust <- rbind(tab.rq1.euglena,tab_all_interactions,tab_mean_abs_mean,tab.rq1.partitioned)
+
+plot.robust1 <- ddrq1_treat_14_robust %>%
+	dplyr::filter(robust %in% c("Partitioned data","Without euglena")) %>%
+  ggplot(aes(count,RMSE, shape=treat, col=robust, fill=robust))+
+  facet_wrap(~treat)+
+  geom_ribbon(data=newdat_robust %>% dplyr::filter(model=="count",
+  																								 robust %in% c("Partitioned data","Without euglena")),
+  						aes(ymax=lower.count,ymin=upper.count), alpha=0.2, col=NA) +
+  geom_point(size=1.2, alpha=0.33) +
+  geom_line(data=newdat_robust %>% dplyr::filter(model=="count",
+  																							 robust %in% c("Partitioned data","Without euglena")), 
+            size=1.2) +	
+	scale_shape_manual(values=c(21,23))+
+	scale_fill_manual(values = names(robust_levels), 
+										breaks = robust_levels, 
+										aesthetics = c("col","fill")) +  
+  standard_theme()+
+	theme(legend.position = "none",
+				panel.spacing =  unit(0, "lines"),
+				strip.text.x = element_blank(),
+				plot.subtitle = ggtext::element_markdown()) +
+	labs(x="Number of interactions", y="RMSE", tag = "A")
+
+
+plot.robust2 <- ddrq1_treat_14_robust %>%
+  ggplot(aes(mean_mean_abs,RMSE, shape=treat, col=robust, fill=robust))+
+  facet_wrap(~treat)+
+  geom_ribbon(data=newdat_robust %>% dplyr::filter(model=="mean_mean_abs"),
+  						aes(ymax=lower.mean_mean_abs,ymin=upper.mean_mean_abs), alpha=0.2, col=NA) +
+  geom_point(size=1.2, alpha=0.33) +
+  geom_line(data=newdat_robust %>% dplyr::filter(model=="mean_mean_abs"), size=1.2) +
+	scale_shape_manual(values=c(21,23))+
+	scale_fill_manual(values = names(robust_levels), 
+										breaks = robust_levels, 
+										aesthetics = c("col","fill")) +  
+	standard_theme()+
+	theme(legend.position = "none",
+				panel.spacing =  unit(0, "lines"),
+				strip.text.x = element_blank(),
+				plot.subtitle = ggtext::element_markdown()) +
+	labs(x="Mean interaction strength", y="RMSE", tag = "B")
+
+plot.robust3 <- ddrq1_treat_14_robust %>%
+	dplyr::filter(robust != "All interactions considered") %>%
+  ggplot(aes(count, mean_mean_abs, shape=treat, col=robust, fill=robust))+
+  geom_ribbon(data=newdat_robust %>% dplyr::filter(model=="corr",robust != "All interactions considered"),
+  						aes(ymax=lower.corr,ymin=upper.corr), alpha=0.2, col=NA) +
+  geom_point(size=1.2, alpha=0.33) +
+  geom_line(data=newdat_robust %>% dplyr::filter(model=="corr",robust != "All interactions considered"),
+  					size=1.2)+
+	scale_shape_manual(values=c(21,23))+
+	scale_fill_manual(values = names(robust_levels), 
+										breaks = robust_levels, 
+										aesthetics = c("col","fill")) +  
+	standard_theme()+
+	theme(legend.position = "none",
+				panel.spacing =  unit(0, "lines"),
+				strip.text.x = element_blank(),
+				plot.subtitle = ggtext::element_markdown()) +
+	facet_wrap(~treat) + 
+	labs(x="Number of interactions", y="Mean interaction strength", tag = "C")
+
+plot.robust.leg <- ddrq1_treat_14_robust %>%
+  ggplot(aes(count, mean_mean_abs, shape=treat, col=robust, fill=robust))+
+  geom_line(data=newdat_robust %>% dplyr::filter(model=="corr"))+
+  geom_ribbon(data=newdat_robust %>% dplyr::filter(model=="corr"), aes(ymax=lower.corr,ymin=upper.corr), alpha=0.2, col=NA) +
+  geom_point(size=2, alpha=1) +
+	scale_shape_manual(values=c(21,23))+
+	scale_fill_manual(values = names(robust_levels), 
+										breaks = robust_levels, 
+										aesthetics = c("col","fill")) +  
+	standard_theme()+
+	theme(legend.position = "right",
+				panel.spacing =  unit(0, "lines"),
+				strip.text.x = element_blank(),
+				plot.subtitle = ggtext::element_markdown()) +
+	facet_wrap(~treat) + 
+	labs(x="Number of interactions", y="Mean interaction strength", tag = "C", 
+			 shape="Temperature", col="", fill="")
+
+plot.robust.leg <- get_legend(plot.robust.leg)
+```
+
+
+### Effects of measurement methods
+
+```{r measurement_method_calc, message=FALSE, warning=FALSE, cache=TRUE}
+ddrq1_treat_14_methods <- ddrq1_treat_14_thetas %>%
+	dplyr::filter(theta==5) %>%
+	dplyr::mutate(Species=target) %>%
+	full_join(taxa, by = "Species")
+
+ddrq1_treat_14_methods <- ddrq1_treat_14_methods[1:144,]
+ddrq1_treat_14_methods$Target2 <- label[ddrq1_treat_14_methods$Target]
+
+boxplot1 <- ddrq1_treat_14_methods %>%
+	ggplot(aes(Measured_with, RMSE)) +
+	geom_boxplot() +
+	geom_point(aes(col=Target2,fill=Target2, shape=treat), size=2, alpha=0.6) +
+	scale_shape_manual(values=c(21,23))+
+  facet_wrap(~treat)+
+	scale_fill_brewer(palette = "Dark2", aesthetics = c("col","fill")) +
+  standard_theme()+
+	theme(legend.position = "none",
+				panel.spacing =  unit(0, "lines"),
+				strip.text.x = element_blank(),
+				legend.text = ggtext::element_markdown()) + 
+	labs(x="Measurement method", y="RMSE", tag = "A", 
+			 shape="Temperature", col="Target", fill="Target") +
+	coord_flip()
+
+boxplot2 <- ddrq1_treat_14_methods %>%
+	ggplot(aes(Measured_with, count)) +
+	geom_boxplot() +
+	geom_point(aes(col=Target2,fill=Target2, shape=treat), size=2, alpha=0.6) +
+	scale_shape_manual(values=c(21,23))+
+  facet_wrap(~treat)+
+	scale_fill_brewer(palette = "Dark2", aesthetics = c("col","fill")) +
+  standard_theme()+
+	theme(legend.position = "none",
+				panel.spacing =  unit(0, "lines"),
+				strip.text.x = element_blank(),
+				legend.text = ggtext::element_markdown())  + 
+	labs(x="Measurement method", y="Number of interactions", tag = "B", 
+			 shape="Temperature", col="Target", fill="Target")+
+	coord_flip()
+
+boxplot3 <- ddrq1_treat_14_methods %>%
+	ggplot(aes(Measured_with, mean_mean_abs)) +
+	geom_boxplot() +
+	geom_point(aes(col=Target2,fill=Target2, shape=treat), size=2, alpha=0.6) +
+	scale_shape_manual(values=c(21,23))+
+  facet_wrap(~treat)+
+	scale_fill_brewer(palette = "Dark2", aesthetics = c("col","fill")) +
+  standard_theme()+
+	theme(legend.position = "right",
+				panel.spacing =  unit(0, "lines"),
+				legend.box = "horizontal",
+				strip.text.x = element_blank(),
+				legend.text = ggtext::element_markdown()) + 
+	labs(x="Measurement method", y="Mean interaction strength", tag = "C", 
+			 shape="Temperature", col="Target", fill="Target")+
+	coord_flip()
+
+boxplot_legend <- get_legend(boxplot3)
+boxplot3 <- boxplot3 + theme(legend.position = "none")
+
+ddrq1_treat_14_methods_meas <- ddrq1_treat_14_methods %>%
+	group_by(Measured_with,treat) %>%
+	summarize(min_count=min(count),
+						max_count=max(count),
+						min_is=min(mean_mean_abs),
+						max_is=max(mean_mean_abs))
+
+
+
+newdata.meas <- apply(ddrq1_treat_14_methods_meas, 1, function(row){
+	data.frame(count=seq(row["min_count"],row["max_count"],length.out = 100),
+						 mean_mean_abs=seq(row["min_is"],row["max_is"],length.out = 100),
+						 Measured_with=row["Measured_with"],
+						 treat=row["treat"])
+})
+
+newdata.meas <- do.call("rbind",newdata.meas)
+
+m.count.meas <- lmer(RMSE~Measured_with*count*treat + (1|ID), data = ddrq1_treat_14_methods)
+newdata.meas.count <- newdata.meas
+newdata.meas.count$RMSE <- predict(m.count.meas, newdata.meas.count, re.form=NA)
+mm.meas.count <- model.matrix(terms(m.count.meas),newdata.meas.count)
+pvar1.meas.count <- diag(mm.meas.count %*% tcrossprod(vcov(m.count.meas),mm.meas.count))
+newdata.meas.count <- data.frame(newdata.meas.count,
+																lower=newdata.meas.count$RMSE-cmult*sqrt(pvar1.meas.count),
+																upper=newdata.meas.count$RMSE+cmult*sqrt(pvar1.meas.count))
+newdata.meas.count$model <- "count"
+
+
+meas.plot1 <- ddrq1_treat_14_methods %>%
+  ggplot(aes(count,RMSE, shape=treat, col=Measured_with, fill=Measured_with))+
+  facet_wrap(~treat)+
+  geom_line(data=newdata.meas.count)+
+  geom_ribbon(data=newdata.meas.count, aes(ymax=upper,ymin=lower),
+  						alpha=0.2, col=NA) +
+	geom_point(size=2, alpha=0.6) +
+	scale_shape_manual(values=c(21,23))+
+	scale_fill_brewer(palette = "Dark2", aesthetics = c("col","fill"))+
+  standard_theme()+
+	theme(legend.position = "none",
+				panel.spacing =  unit(0, "lines"),
+				strip.text.x = element_blank(),
+				plot.subtitle = ggtext::element_markdown())  + 
+	labs(y="RMSE", x="Number of interactions", tag = "A", 
+			 shape="Temperature", col="Measured with", fill="Measured with") 
+
+
+m.is.meas <- lmer(RMSE~Measured_with*mean_mean_abs*treat + (1|ID), data = ddrq1_treat_14_methods)
+newdata.meas.is <- newdata.meas
+newdata.meas.is$RMSE <- predict(m.is.meas, newdata.meas.is, re.form=NA)
+mm.meas.is <- model.matrix(terms(m.is.meas),newdata.meas.is)
+pvar1.meas.is <- diag(mm.meas.is %*% tcrossprod(vcov(m.is.meas),mm.meas.is))
+newdata.meas.is <- data.frame(newdata.meas.is,
+															lower=newdata.meas.is$RMSE-cmult*sqrt(pvar1.meas.is),
+															upper=newdata.meas.is$RMSE+cmult*sqrt(pvar1.meas.is))
+newdata.meas.is$model <- "is"
+
+meas.plot2 <- ddrq1_treat_14_methods %>%
+  ggplot(aes(mean_mean_abs,RMSE, shape=treat, col=Measured_with, fill=Measured_with))+
+  facet_wrap(~treat)+
+  geom_line(data=newdata.meas.is)+
+  geom_ribbon(data=newdata.meas.is, aes(ymax=upper,ymin=lower),
+  						alpha=0.2, col=NA) +
+	geom_point(size=2, alpha=0.6) +
+	scale_shape_manual(values=c(21,23))+
+	scale_fill_brewer(palette = "Dark2", aesthetics = c("col","fill"))+
+  standard_theme()+
+	theme(legend.position = "none",
+				panel.spacing =  unit(0, "lines"),
+				strip.text.x = element_blank(),
+				plot.subtitle = ggtext::element_markdown())  + 
+	labs(y="RMSE", x="Mean interaction strength", tag = "B", 
+			 shape="Temperature", col="Measured with", fill="Measured with") 
+
+
+m.is.count.meas <- lmer(mean_mean_abs~Measured_with*count*treat + (1|ID), data = ddrq1_treat_14_methods)
+newdata.meas.is.count <- newdata.meas
+newdata.meas.is.count$mean_mean_abs <- NULL
+newdata.meas.is.count$mean_mean_abs <- predict(m.is.count.meas, newdata.meas.is.count, re.form=NA)
+mm.meas.is.count <- model.matrix(terms(m.is.count.meas),newdata.meas.is.count)
+pvar1.meas.is.count <- diag(mm.meas.is.count %*% tcrossprod(vcov(m.is.count.meas),mm.meas.is.count))
+newdata.meas.is.count <- data.frame(newdata.meas.is.count,
+																		lower=newdata.meas.is.count$mean_mean_abs-cmult*sqrt(pvar1.meas.is.count),
+																		upper=newdata.meas.is.count$mean_mean_abs+cmult*sqrt(pvar1.meas.is.count))
+newdata.meas.is.count$model <- "is.count"
+
+meas.plot3 <- ddrq1_treat_14_methods %>%
+  ggplot(aes(count, mean_mean_abs, shape=treat, col=Measured_with, fill=Measured_with))+
+  facet_wrap(~treat)+
+  geom_line(data=newdata.meas.is.count)+
+  geom_ribbon(data=newdata.meas.is.count, aes(ymax=upper,ymin=lower),
+  						alpha=0.2, col=NA) +
+	geom_point(size=2, alpha=0.6) +
+	scale_shape_manual(values=c(21,23))+
+	scale_fill_brewer(palette = "Dark2", aesthetics = c("col","fill"))+
+  standard_theme()+
+	theme(legend.position = "right",
+				panel.spacing =  unit(0, "lines"),
+				strip.text.x = element_blank(),
+				plot.subtitle = ggtext::element_markdown())  + 
+	labs(y="Mean interaction strength", x="Number of interactions", tag = "C", 
+			 shape="Temperature", col="Measured with", fill="Measured with")
+
+rm(m.count.meas,newdata.meas.count,mm.meas.count,pvar1.meas.count,
+	 m.is.meas,newdata.meas.is,mm.meas.is,pvar1.meas.is,
+	 m.is.count.meas,newdata.meas.is.count,mm.meas.is.count,pvar1.meas.is.count)
+```
+
+
+### Variation in the recorded data
+
+```{r rq1_cv, cache=TRUE, warning=FALSE, message=FALSE}
+ddrq1_treat_14_theta5 <- ddrq1_treat_14_thetas %>% dplyr::filter(theta==5)
+ddrq1_treat_14_theta5$Target2 <- label[ddrq1_treat_14_theta5$Target]
+
+
+m.cv.rmse <- lmer(RMSE~cv*treat + (1|ID), data = ddrq1_treat_14_theta5)
+newdat.cv.rmse <- expand.grid(cv = seq(min(ddrq1_treat_14_theta5$cv),
+																			 max(ddrq1_treat_14_theta5$cv),length.out = 200),
+															treat = unique(ddrq1_treat_14_theta5$treat))		
+newdat.cv.rmse$RMSE <- predict(m.cv.rmse, newdat.cv.rmse, re.form=NA)
+mm.cv.rmse <- model.matrix(terms(m.cv.rmse),newdat.cv.rmse)
+pvar1.cv.rmse <- diag(mm.cv.rmse %*% tcrossprod(vcov(m.cv.rmse),mm.cv.rmse))
+newdat.cv.rmse <- data.frame(newdat.cv.rmse,
+														 lower.iso=newdat.cv.rmse$RMSE-cmult*sqrt(pvar1.cv.rmse),
+														 upper.iso=newdat.cv.rmse$RMSE+cmult*sqrt(pvar1.cv.rmse))
+newdat.cv.rmse$model <- "cv.rmse"
+
+m.cv.count <- lmer(count~cv*treat + (1|ID), data = ddrq1_treat_14_theta5)
+newdat.cv.count <- expand.grid(cv = seq(min(ddrq1_treat_14_theta5$cv),
+																						 max(ddrq1_treat_14_theta5$cv),length.out = 200),
+													treat = unique(ddrq1_treat_14_theta5$treat))		
+newdat.cv.count$count <- predict(m.cv.count, newdat.cv.count, re.form=NA)
+mm.cv.count <- model.matrix(terms(m.cv.count),newdat.cv.count)
+pvar1.cv.count <- diag(mm.cv.count %*% tcrossprod(vcov(m.cv.count),mm.cv.count))
+newdat.cv.count <- data.frame(newdat.cv.count,
+															lower.iso=newdat.cv.count$count-cmult*sqrt(pvar1.cv.count),
+															upper.iso=newdat.cv.count$count+cmult*sqrt(pvar1.cv.count))
+newdat.cv.count$model <- "cv.count"
+
+m.cv.mean_mean_abs <- lmer(mean_mean_abs~cv*treat + (1|ID), data = ddrq1_treat_14_theta5)
+newdat.cv.mean_mean_abs <- expand.grid(cv = seq(min(ddrq1_treat_14_theta5$cv),
+																								max(ddrq1_treat_14_theta5$cv),length.out = 200),
+																			 treat = unique(ddrq1_treat_14_theta5$treat))		
+newdat.cv.mean_mean_abs$mean_mean_abs <- predict(m.cv.mean_mean_abs, newdat.cv.mean_mean_abs, re.form=NA)
+mm.cv.mean_mean_abs <- model.matrix(terms(m.cv.mean_mean_abs),newdat.cv.mean_mean_abs)
+pvar1.cv.mean_mean_abs <- diag(mm.cv.mean_mean_abs %*% tcrossprod(vcov(m.cv.mean_mean_abs),mm.cv.mean_mean_abs))
+newdat.cv.mean_mean_abs <- data.frame(newdat.cv.mean_mean_abs,
+															lower.iso=newdat.cv.mean_mean_abs$mean_mean_abs-cmult*sqrt(pvar1.cv.mean_mean_abs),
+															upper.iso=newdat.cv.mean_mean_abs$mean_mean_abs+cmult*sqrt(pvar1.cv.mean_mean_abs))
+newdat.cv.mean_mean_abs$model <- "cv.mean_mean_abs"
+
+plot1aCV <-
+	ddrq1_treat_14_theta5 %>%
+  ggplot(aes(x=cv, y=RMSE, group=treat, shape=treat))+
+  geom_line(data=newdat.cv.rmse)+
+  geom_ribbon(data=newdat.cv.rmse, aes(ymax=lower.iso,ymin=upper.iso), alpha=0.2, col=NA) +
+	geom_point(size=2, alpha=0.5, fill="black")+
+	scale_shape_manual(values=c(21,23))+
+	scale_fill_brewer(palette = "Dark2", aesthetics = c("fill","col"))+
+	standard_theme()+
+	theme(legend.position = "none",
+				panel.spacing =  unit(0, "lines"),
+				strip.text.x = element_blank(),
+				plot.subtitle = ggtext::element_markdown()) +
+	facet_wrap(~treat)+
+	labs(x="Coefficient of variation", y="RMSE", tag = "A")
+
+plot1bCV <-
+	ddrq1_treat_14_theta5 %>%
+  ggplot(aes(y=count, x=cv, group=treat, shape=treat))+
+  geom_line(data=newdat.cv.count)+
+  geom_ribbon(data=newdat.cv.count, aes(ymax=lower.iso,ymin=upper.iso), alpha=0.2, col=NA) +
+	geom_point(size=2, alpha=0.5, fill="black")+
+	scale_shape_manual(values=c(21,23))+
+	scale_fill_brewer(palette = "Dark2", aesthetics = c("fill","col"))+
+	standard_theme()+
+	theme(legend.position = "none",
+				panel.spacing =  unit(0, "lines"),
+				strip.text.x = element_blank(),
+				plot.subtitle = ggtext::element_markdown()) +
+	facet_wrap(~treat)+
+	labs(y="Number of interactions", x="Coefficient of variation", tag = "B")
+
+plot1cCV <- ddrq1_treat_14_theta5 %>%
+  ggplot(aes(y=mean_mean_abs, x=cv, group=treat, shape=treat))+
+  geom_line(data=newdat.cv.mean_mean_abs)+
+  geom_ribbon(data=newdat.cv.mean_mean_abs, aes(ymax=lower.iso,ymin=upper.iso),
+              alpha=0.2, col=NA) +
+	geom_point(size=2, alpha=0.5, fill="black")+
+	scale_shape_manual(values=c(21,23))+
+	scale_fill_brewer(palette = "Dark2", aesthetics = c("fill","col"))+
+	standard_theme()+
+	theme(legend.position = "right",
+				panel.spacing =  unit(0, "lines"),
+				strip.text.x = element_blank(),
+				plot.subtitle = ggtext::element_markdown()) +
+	facet_wrap(~treat)+
+	labs(y="Mean interaction strength", x="Coefficient of variation", tag = "C")
+
+rm(m.cv.rmse,newdat.cv.rmse,mm.cv.rmse,pvar1.cv.rmse,
+	 m.cv.count,newdat.cv.count,mm.cv.count,pvar1.cv.count,
+	 m.cv.mean_mean_abs,newdat.cv.mean_mean_abs,mm.cv.mean_mean_abs,pvar1.cv.mean_mean_abs)
+```
+
+## Forecasting robustness analyses 
+
+### Using the best multiview models
+
+```{r mean_int_rmse_plot_with_best_model_calc_, fig.width=13, fig.height=6, out.width="95%", cache=TRUE, message=FALSE, warning=FALSE}
+ddrq1_best <- ddrq1_equi %>% 
+	dplyr::filter(RMSE_equi==T) %>%
+	group_by(ID, treat, Target) %>%
+	slice_min(num_pred,n=1) %>%
+	slice_min(RMSE,n=1) %>% 
+	sample_n(1) %>%
+	full_join(dd_smap_params_abs)
+
+ddrq1_best <- full_join(ddrq1_best, cv)
+ddrq1_best <- full_join(ddrq1_best, permutation_entropies)
+ddrq1_best$target <- ddrq1_best$Target
+ddrq1_best <- ddrq1_best %>% dplyr::select(-best_rmse_bool,-min_rmse,-RMSE_equi)
+ddrq1_best$treat <- ifelse(ddrq1_best$treat=="const","Constant","Fluctuating")
+ddrq1_best$Target2 <- label[ddrq1_best$Target]
+ddrq1_best$robust <- "Best multiview EDM model"
+
+rq1_model_fcts_list <- rq1_model_fcts(ddrq1_best)
+newdat_robust_best <- rq1_model_fcts_list[[1]]
+tab.rq1.best <- rq1_model_fcts_list[[2]]
+
+tab.rq1.best <- tab.rq1.best[1:15,]
+newdat_robust_best$robust <- "Best multiview EDM model"
+
+rm(rq1_model_fcts_list)
+```
+
+### Univariate simplex with optimal E
+
+```{r univariatesimplex, message=FALSE, warning=FALSE, cache=TRUE}
+dd_simplex <- lapply(targets, function(target){
+  simplexForecasting(dd2, target, num.clusters = 1, maxE = 7)
+})
+dd_simplex <- do.call("rbind", dd_simplex)
+
+dd_simplex <- full_join(dd_simplex, dd_smap_params_abs)
+
+rq1_model_fcts_list <- rq1_model_fcts(dd_simplex)
+newdat_simplex <- rq1_model_fcts_list[[1]]
+tab.rq1.simplex <- rq1_model_fcts_list[[2]]
+
+tab.rq1.simplex <- tab.rq1.simplex[1:15,]
+newdat_simplex$robust <- "Univariate simplex EDM"
+```
+
+
+### Merging results
+
+```{r univariatesimplex_merging, message=FALSE, warning=FALSE, cache=TRUE}
+dd_forecasts_merge <- dd_simplex
+dd_forecasts_merge$RMSE_mv <- ddrq1_treat_14$RMSE
+
+dd_forecasts_merge$Treat <- ifelse(dd_forecasts_merge$treat=="const",
+														 "Constant temperature","Fluctuating temperature")
+dd_forecasts_merge$treat4 <- ifelse(dd_forecasts_merge$treat=="const","Constant","Fluctuating")
+dd_forecasts_merge$Target <- label[dd_forecasts_merge$Target]
+
+ddrq1_best_suppl$RMSEbest <- ddrq1_best_suppl$RMSE
+dd_forecasts_merge <- full_join(dd_forecasts_merge, ddrq1_best_suppl[,c("Target","ID","RMSEbest")])
+
+dd_forecasts_merge_long <- dd_forecasts_merge %>% pivot_longer(cols = c("RMSE","RMSE_mv","RMSEbest")) %>%
+  mutate(name=ifelse(name=="RMSE","Univariate\nsimplex EDM",
+                     ifelse(name=="RMSE_mv","Full multiview\nEDM model","Best multiview\nEDM model")))
+dd_forecasts_merge_long2 <- dd_forecasts_merge %>% pivot_longer(cols = c("RMSE","RMSEbest")) %>%
+  mutate(name=ifelse(name=="RMSE","Univariate simplex EDM","Best multiview EDM model"))
+
+forecast_boxplot <- dd_forecasts_merge_long %>%
+  ggplot(aes(name,value,col=name,shape=treat))+
+  facet_wrap(~treat)+
+  geom_boxplot() +
+  geom_point(aes(fill=name),size=1.2, alpha=0.3)+
+  scale_color_brewer(palette = "Dark2", aesthetics = c("fill","col"))+
+	scale_shape_manual(values=c(21,23))+
+  standard_theme()+
+  theme(legend.position = "none",
+				panel.spacing =  unit(0, "lines"),
+				strip.text.x = element_blank())+
+	labs(x="", y="RMSE", tag = "A",col="",fill="")
+
+cols <- brewer.pal(3,"Dark2")
+
+forecast_corr <- dd_forecasts_merge_long2 %>%
+  ggplot(aes(value,RMSE_mv,fill=name,col=name,shape=treat))+
+  geom_abline(slope = 1, intercept = 0)+
+  facet_wrap(~treat)+
+  geom_point(size=1.2, alpha=0.6) +
+  standard_theme2() +
+	scale_shape_manual(values=c(21,23))+
+  theme(legend.position = "none",
+				panel.spacing =  unit(0, "lines"),
+				strip.text.x = element_blank())+
+  scale_fill_manual(values = cols[c(1,3)], aesthetics = c("fill","col"))+
+	labs(x="RMSE of respective model", y="RMSE of full\nmultiview EDM model", tag = "B",col="",fill="")
+
+####
+
+newdat_forecast <- full_join(newdat_simplex, 
+                           full_join(newdat_robust_best,newdat_thetas %>% dplyr::filter(theta==5)))
+
+ddrq1_best$temperature_included <- as.logical(ddrq1_best$temperature_included)
+ddrq1_treat_14$temperature_included <- as.logical(ddrq1_treat_14$temperature_included)
+ddrq1_best$target_excluded <- as.logical(ddrq1_best$target_excluded)
+ddrq1_treat_14$target_excluded <- as.logical(ddrq1_treat_14$target_excluded)
+
+dd_simplex$robust <- "Univariate simplex EDM"
+ddrq1_treat_14$robust <- "Full multiview EDM model"
+ddrq1_best$robust <- "Best multiview EDM model"
+dd_forecast <- full_join(full_join(dd_simplex, ddrq1_best),ddrq1_treat_14)
+
+tab.rq1.best <- cbind(Model="Best multiview EDM model",tab.rq1.best)
+tab.rq1.simplex<- cbind(Model="Univariate simplex EDM",tab.rq1.simplex)
+tab.model <- rbind(tab.rq1.best,tab.rq1.simplex)
+
+dd_forecast$treat <- ifelse(dd_forecast$treat %in% c("const","Constant"),"Constant","Fluctuating")
+newdat_forecast$robust <- ifelse(is.na(newdat_forecast$robust),"Full multiview EDM model",newdat_forecast$robust)
+
+plot.simplexbest1 <- dd_forecast %>%
+  ggplot(aes(count,RMSE, shape=treat, col=robust, fill=robust))+
+  facet_wrap(~treat)+
+  geom_ribbon(data=newdat_forecast %>% dplyr::filter(model=="count"),
+  						aes(ymax=lower.count,ymin=upper.count), alpha=0.2, col=NA) +
+  geom_point(size=1.2, alpha=0.33) +
+  geom_line(data=newdat_forecast %>% dplyr::filter(model=="count"), 
+            size=1.2) +	
+	scale_shape_manual(values=c(21,23))+
+	scale_fill_brewer(palette = "Dark2",aesthetics = c("col","fill")) +  
+  standard_theme()+
+	theme(legend.position = "none",
+				panel.spacing =  unit(0, "lines"),
+				strip.text.x = element_blank(),
+				plot.subtitle = ggtext::element_markdown()) +
+	labs(x="Number of interactions", y="RMSE", tag = "C")
+
+
+plot.simplexbest2 <- dd_forecast %>%
+  ggplot(aes(mean_mean_abs,RMSE, shape=treat, col=robust, fill=robust))+
+  facet_wrap(~treat)+
+  geom_ribbon(data=newdat_forecast %>% dplyr::filter(model=="mean_mean_abs"),
+  						aes(ymax=lower.mean_mean_abs,ymin=upper.mean_mean_abs), alpha=0.2, col=NA) +
+  geom_point(size=1.2, alpha=0.33) +
+  geom_line(data=newdat_forecast %>% dplyr::filter(model=="mean_mean_abs"), size=1.2) +
+	scale_shape_manual(values=c(21,23))+
+	scale_fill_brewer(palette = "Dark2",aesthetics = c("col","fill")) +  
+	standard_theme()+
+	theme(legend.position = "none",
+				panel.spacing =  unit(0, "lines"),
+				strip.text.x = element_blank(),
+				plot.subtitle = ggtext::element_markdown()) +
+	labs(x="Mean interaction strength", y="RMSE", tag = "D")
+
+plot.simplexbest.leg <- dd_forecast %>%
+  ggplot(aes(count, mean_mean_abs, shape=treat, col=robust, fill=robust))+
+  geom_line(data=newdat_forecast %>% dplyr::filter(model=="corr"))+
+  geom_ribbon(data=newdat_forecast %>% dplyr::filter(model=="corr"), aes(ymax=lower.corr,ymin=upper.corr), alpha=0.2, col=NA) +
+  geom_point(size=2, alpha=1) +
+	scale_shape_manual(values=c(21,23))+
+	scale_fill_brewer(palette = "Dark2",aesthetics = c("col","fill")) +  
+	standard_theme()+
+	theme(legend.position = "right",
+				panel.spacing =  unit(0, "lines"),
+				strip.text.x = element_blank(),
+				plot.subtitle = ggtext::element_markdown()) +
+	facet_wrap(~treat) + 
+	labs(x="Number of interactions", y="Mean interaction strength", tag = "C", 
+			 shape="Temperature", col="Forecast model", fill="Forecast model")
+
+plot.simplexbest.leg <- get_legend(plot.simplexbest.leg)
+```
+
+## Forecasting: using other methods
+
+### ARIMA
+
+```{r arima_forecast, message=FALSE, warning=FALSE, cache=TRUE}
+dd2.list <- split(dd2, f=dd2$ID)
+
+arima.forecast.rmse <- lapply(dd2.list, function(df){
+  ID <- unique(df$ID)
+  treat <- unique(df$treat)
+  treat2 <- unique(df$treat2)
+  treat3 <- unique(df$treat3)
+  
+  df <- df %>%
+    ungroup() %>%
+    dplyr::select(-ID, -treat, -treat2, -treat3, -date, -incubator)
+  
+  lib <- 1:floor(NROW(df)*2/3)
+  pred <- (floor(NROW(df)*2/3) + 1):NROW(df)
+  
+  b.train <- df[lib,]
+  b.forecast <- df[pred,]
+  
+  covariates <- colnames(df)[-1]
+  
+  b.temp <- lapply(targets, function(target){
+    
+    idx <- which(target==covariates)
+    predictors <- covariates[-idx]
+    m <- auto.arima(b.train[target], d=0) #xreg = as.matrix(b.train[,predictors])
+    # checkresiduals(m)
+    forecast <- fitted(Arima(df[,target],model=m))[pred] #xreg = as.matrix(b.forecast[,predictors])
+    
+    rmse <- sqrt(mean((unlist(b.forecast[target])-forecast)^2, na.rm = T))
+    
+    data.frame(Target=target, ID=ID, RMSE=rmse, treat=treat, treat2=treat2, treat=treat3)
+  })
+  
+  do.call("rbind", b.temp)
+})
+
+arima.forecast.rmse <- do.call("rbind", arima.forecast.rmse)
+
+arima.forecast.rmse <- full_join(arima.forecast.rmse, dd_smap_params_abs)
+
+rq1_model_fcts_list <- rq1_model_fcts(arima.forecast.rmse)
+newdat_arima <- rq1_model_fcts_list[[1]]
+tab.rq1.arima <- rq1_model_fcts_list[[2]]
+
+tab.rq1.arima <- tab.rq1.arima[1:10,]
+newdat_arima$robust <- "ARIMA"
+
+arima.forecast.rmse$treat <- ifelse(arima.forecast.rmse$treat=="const","Constant","Fluctuating")
+arima.forecast.rmse$Target2 <- label[arima.forecast.rmse$Target]
+```
+
+### Recurrent neural networks
+
+The following code-chunk is not run. Its result are loaded in later.
+```{r RNN_forecast, message=FALSE, warning=FALSE, cache=TRUE, eval=FALSE}
+# set some parameters for our model
+batch_size <- 64 # number of sequences to look at at one time during training
+total_epochs <- 30 # how many times we'll look @ the whole dataset while training our model
+
+# set a random seed for reproducability
+set.seed(123)
+
+possible_predictors <- c("bacteria","chlamydomonas_reinhardtii","colpidium_striatum",
+                         "dexiostomata_campylum", "didinium_nasutum",
+                         "euglena_gracilis","euplotes_daidaleos","paramecium_caudatum",
+                         "rotifer_sp","big_white_particle","dissolved_oxygen",
+                         "green_white_particle", "small_white_particle",
+                         "temperature")
+
+dd2.list <- split(dd2, f=dd2$ID)
+
+RNN.forecast.rmse <- mclapply(dd2.list, function(df){
+  ID <- unique(df$ID)
+  treat <- unique(df$treat)
+  treat2 <- unique(df$treat2)
+  treat3 <- unique(df$treat3)
+  
+  df <- df %>%
+    ungroup() %>%
+    dplyr::select(-ID, -treat, -treat2, -treat3, -date, -incubator)
+  
+  lib <- 1:floor(NROW(df)*2/3)
+  pred <- (floor(NROW(df)*2/3) + 1):NROW(df)
+
+  X_train <- as.matrix(df[lib[-length(lib)], possible_predictors])
+  X_test <- as.matrix(df[pred[-length(pred)], possible_predictors])
+    
+  b.temp <- lapply(targets, function(target){
+    
+    y_train <- as.matrix(df[lib[-1], target])
+    y_test <- as.matrix(df[pred[-1], target])
+    
+    # initialize our model
+    # install_keras()
+    model <- keras_model_sequential() %>%
+      layer_dense(units = 6, activation = 'relu', input_shape = length(possible_predictors), 
+                  kernel_initializer=initializer_random_uniform(seed = 43)) %>% 
+      layer_dense(units = 36, activation = 'relu',
+                  kernel_initializer=initializer_random_uniform(seed = 23)) %>%
+      layer_dense(units = 1, activation = 'linear',
+                  kernel_initializer=initializer_random_uniform(seed = 55))
+    
+    model %>% compile(
+      loss = 'mean_squared_error',
+      optimizer = 'adam',
+      metrics = c('mae')
+    )
+    
+    # Actually train our model! This step will take a while
+    trained_model <- model %>% fit(
+      x = X_train, # sequence we're using for prediction 
+      y = y_train, # sequence we're predicting
+      batch_size = batch_size, # how many samples to pass to our model at a time
+      epochs = total_epochs, # how many times we'll look @ the whole dataset
+      verbose=0,
+      validation_split = 0.1) # how much data to hold out for testing as we go along
+    
+    forecast <- data.frame(y = predict(model, x=X_test))
+    
+    rmse <- sqrt(mean(unlist(y_test-forecast)^2, na.rm = T))
+    
+    data.frame(Target=target, ID=ID, RMSE=rmse, treat=treat, treat2=treat2, treat=treat3)
+  })
+  
+  do.call("rbind", b.temp)
+}, mc.cores=detectCores()-2)
+
+RNN.forecast.rmse <- do.call("rbind", RNN.forecast.rmse)
+save(RNN.forecast.rmse, file = here("Data/Multiview_forecast_data/RNN_forecast_rmse.RData"))
+```
+
+
+### ARIMA and RNN put together
+
+```{r ARIMA_RNN_merging, message=FALSE, warning=FALSE, cache=TRUE}
+load(here("Data/Multiview_forecast_data/RNN_forecast_rmse.RData"))
+RNN.forecast.rmse <- full_join(RNN.forecast.rmse, dd_smap_params_abs)
+
+rq1_model_fcts_list <- rq1_model_fcts(RNN.forecast.rmse)
+newdat_rnn <- rq1_model_fcts_list[[1]]
+tab.rq1.rnn <- rq1_model_fcts_list[[2]]
+
+tab.rq1.rnn <- tab.rq1.rnn[1:10,]
+newdat_rnn$robust <- "RNN"
+
+RNN.forecast.rmse$treat <- ifelse(RNN.forecast.rmse$treat=="const","Constant","Fluctuating")
+RNN.forecast.rmse$Target <- label[RNN.forecast.rmse$Target]
+
+dd_forecasts_merge2 <- RNN.forecast.rmse
+dd_forecasts_merge2$RMSE_arima <- arima.forecast.rmse$RMSE
+
+dd_forecasts_merge2 <- full_join(dd_forecasts_merge2, ddrq1_best_suppl[,c("Target","ID","RMSEbest")])
+
+dd_forecasts_merge2_long <- dd_forecasts_merge2 %>% pivot_longer(cols = c("RMSE","RMSE_arima","RMSEbest")) %>%
+  mutate(name=ifelse(name=="RMSE","RNN",
+                     ifelse(name=="RMSE_arima","ARIMA","Best EDM")))
+dd_forecasts_merge2_long2 <- dd_forecasts_merge2 %>% pivot_longer(cols = c("RMSE","RMSE_arima")) %>%
+  mutate(name=ifelse(name=="RMSE","RNN","ARIMA"))
+
+forecast_boxplot2 <- dd_forecasts_merge2_long %>%
+  ggplot(aes(name,value,col=name,shape=treat))+
+  facet_wrap(~treat)+
+  geom_boxplot() +
+  geom_point(aes(fill=name),size=1.2, alpha=0.3)+
+  scale_color_brewer(palette = "Dark2", aesthetics = c("fill","col"))+
+	scale_shape_manual(values=c(21,23))+
+  standard_theme()+
+  theme(legend.position = "none",
+				panel.spacing =  unit(0, "lines"),
+				strip.text.x = element_blank())+
+	labs(x="", y="RMSE", tag = "A",col="",fill="")
+
+cols <- names(robust_levels) <- brewer.pal(3,"Dark2")
+
+forecast_corr2 <- dd_forecasts_merge2_long2 %>%
+  ggplot(aes(value,RMSEbest,fill=name,col=name,shape=treat))+
+  geom_abline(slope = 1, intercept = 0)+
+  facet_wrap(~treat, scales="free_x")+
+  geom_point(size=1.2, alpha=0.6) +
+  standard_theme2() +
+	scale_shape_manual(values=c(21,23))+
+  theme(legend.position = "none",
+				panel.spacing =  unit(0, "lines"),
+				strip.text.x = element_blank())+
+  scale_fill_manual(values = cols[c(1,3)], aesthetics = c("fill","col"))+
+	labs(x="RMSE of respective model", y="RMSE of best\nmultiview EDM model", tag = "B",col="",fill="")
+
+####
+newdat_robust_best$robust <- "Best EDM"
+newdat_forecast2 <- full_join(newdat_rnn, 
+                           full_join(newdat_robust_best,newdat_arima))
+
+# ddrq1_best$temperature_included <- as.logical(ddrq1_best$temperature_included)
+# ddrq1_treat_14$temperature_included <- as.logical(ddrq1_treat_14$temperature_included)
+# ddrq1_best$target_excluded <- as.logical(ddrq1_best$target_excluded)
+# ddrq1_treat_14$target_excluded <- as.logical(ddrq1_treat_14$target_excluded)
+
+RNN.forecast.rmse$robust <- "RNN"
+arima.forecast.rmse$robust <- "ARIMA"
+ddrq1_best$robust <- "Best EDM"
+dd_forecast2 <- full_join(full_join(RNN.forecast.rmse, arima.forecast.rmse), ddrq1_best)
+
+tab.rq1.arima <- cbind(Model="ARIMA",tab.rq1.best)
+tab.rq1.rnn<- cbind(Model="RNN",tab.rq1.simplex)
+tab.model2 <- rbind(tab.rq1.arima,tab.rq1.rnn)
+
+dd_forecast2$treat <- ifelse(dd_forecast2$treat %in% c("const","Constant"),"Constant","Fluctuating")
+# newdat_forecast2$robust <- ifelse(is.na(newdat_forecast2$robust),"Full multiview EDM model",newdat_forecast2$robust)
+
+plot.ARIMARNN1 <- dd_forecast2 %>%
+  ggplot(aes(count,RMSE, shape=treat, col=robust, fill=robust))+
+  facet_wrap(~treat)+
+  geom_ribbon(data=newdat_forecast2 %>% dplyr::filter(model=="count"),
+  						aes(ymax=lower.count,ymin=upper.count), alpha=0.2, col=NA) +
+  geom_point(size=1.2, alpha=0.33) +
+  geom_line(data=newdat_forecast2 %>% dplyr::filter(model=="count"), 
+            size=1.2) +	
+	scale_shape_manual(values=c(21,23))+
+	scale_fill_brewer(palette = "Dark2",aesthetics = c("col","fill")) +  
+  standard_theme()+
+	theme(legend.position = "none",
+				panel.spacing =  unit(0, "lines"),
+				strip.text.x = element_blank(),
+				plot.subtitle = ggtext::element_markdown()) +
+	labs(x="Number of interactions", y="RMSE", tag = "C")
+
+
+plot.ARIMARNN2 <- dd_forecast2 %>%
+  ggplot(aes(mean_mean_abs,RMSE, shape=treat, col=robust, fill=robust))+
+  facet_wrap(~treat)+
+  geom_ribbon(data=newdat_forecast2 %>% dplyr::filter(model=="mean_mean_abs"),
+  						aes(ymax=lower.mean_mean_abs,ymin=upper.mean_mean_abs), alpha=0.2, col=NA) +
+  geom_point(size=1.2, alpha=0.33) +
+  geom_line(data=newdat_forecast2 %>% dplyr::filter(model=="mean_mean_abs"), size=1.2) +
+	scale_shape_manual(values=c(21,23))+
+	scale_fill_brewer(palette = "Dark2",aesthetics = c("col","fill")) +  
+	standard_theme()+
+	theme(legend.position = "none",
+				panel.spacing =  unit(0, "lines"),
+				strip.text.x = element_blank(),
+				plot.subtitle = ggtext::element_markdown()) +
+	labs(x="Mean interaction strength", y="RMSE", tag = "D")
+
+plot.ARIMARNN.leg <- dd_forecast2 %>%
+  ggplot(aes(count, mean_mean_abs, shape=treat, col=robust, fill=robust))+
+  geom_line(data=newdat_forecast2 %>% dplyr::filter(model=="corr"))+
+  geom_ribbon(data=newdat_forecast2 %>% dplyr::filter(model=="corr"), aes(ymax=lower.corr,ymin=upper.corr), alpha=0.2, col=NA) +
+  geom_point(size=2, alpha=1) +
+	scale_shape_manual(values=c(21,23))+
+	scale_fill_brewer(palette = "Dark2",aesthetics = c("col","fill")) +  
+	standard_theme()+
+	theme(legend.position = "right",
+				panel.spacing =  unit(0, "lines"),
+				strip.text.x = element_blank(),
+				plot.subtitle = ggtext::element_markdown()) +
+	facet_wrap(~treat) + 
+	labs(x="Number of interactions", y="Mean interaction strength", tag = "C", 
+			 shape="Temperature", col="Forecast model", fill="Forecast model")
+
+plot.ARIMARNN.leg <- get_legend(plot.ARIMARNN.leg)
+
+```
+
+### Permutation entropy
+
+```{r pe_va, cache=TRUE, warning=FALSE, message=FALSE}
+ddrq1_treat_14_theta5$pe.transf <- ddrq1_treat_14_theta5$PE^4
+m.pe.rmse <- lmer(RMSE~pe.transf*treat + (1|ID), data = ddrq1_treat_14_theta5)
+newdat.pe.rmse <- expand.grid(pe.transf = seq(min(ddrq1_treat_14_theta5$pe.transf),
+																								max(ddrq1_treat_14_theta5$pe.transf),length.out = 200),
+																			 treat = unique(ddrq1_treat_14_theta5$treat))		
+newdat.pe.rmse$RMSE <- predict(m.pe.rmse, newdat.pe.rmse, re.form=NA)
+mm.pe.rmse <- model.matrix(terms(m.pe.rmse),newdat.pe.rmse)
+pvar1.pe.rmse <- diag(mm.pe.rmse %*% tcrossprod(vcov(m.pe.rmse),mm.pe.rmse))
+newdat.pe.rmse <- data.frame(newdat.pe.rmse,
+															lower.iso=newdat.pe.rmse$RMSE-cmult*sqrt(pvar1.pe.rmse),
+															upper.iso=newdat.pe.rmse$RMSE+cmult*sqrt(pvar1.pe.rmse))
+newdat.pe.rmse$model <- "pe.rmse"
+
+
+plot1aPE <- ddrq1_treat_14_theta5 %>%
+  ggplot(aes(x=pe.transf, y=RMSE, group=treat, shape=treat))+
+  geom_line(data=newdat.pe.rmse)+
+  geom_ribbon(data=newdat.pe.rmse, aes(ymax=lower.iso,ymin=upper.iso), alpha=0.2, col=NA) +
+	geom_point(size=2, alpha=0.5, fill="black")+
+	scale_shape_manual(values=c(21,23))+
+	scale_fill_brewer(palette = "Dark2", aesthetics = c("fill","col"))+
+	standard_theme()+
+	theme(legend.position = "none",
+				panel.spacing =  unit(0, "lines"),
+				strip.text.x = element_blank(),
+				plot.subtitle = ggtext::element_markdown()) +
+	facet_wrap(~treat)+
+	labs(x="(Permutation entropy)^4", y="RMSE", tag = "A")
+
+
+m.pe.count <- lmer(pe.transf~count*treat + (1|ID), data = ddrq1_treat_14_theta5)
+newdat.pe.count <- expand.grid(count = seq(min(ddrq1_treat_14_theta5$count),
+																								max(ddrq1_treat_14_theta5$count),length.out = 200),
+																			 treat = unique(ddrq1_treat_14_theta5$treat))		
+newdat.pe.count$pe.transf <- predict(m.pe.count, newdat.pe.count, re.form=NA)
+mm.pe.count <- model.matrix(terms(m.pe.count),newdat.pe.count)
+pvar1.pe.count <- diag(mm.pe.count %*% tcrossprod(vcov(m.pe.count),mm.pe.count))
+newdat.pe.count <- data.frame(newdat.pe.count,
+															lower.iso=newdat.pe.count$pe.transf-cmult*sqrt(pvar1.pe.count),
+															upper.iso=newdat.pe.count$pe.transf+cmult*sqrt(pvar1.pe.count))
+newdat.pe.count$model <- "pe.count"
+
+plot1bPE <- ddrq1_treat_14_theta5 %>%
+  ggplot(aes(x=count, y=pe.transf, group=treat, shape=treat))+
+  geom_line(data=newdat.pe.count)+
+  geom_ribbon(data=newdat.pe.count, aes(ymax=lower.iso,ymin=upper.iso), alpha=0.2, col=NA) +
+	geom_point(size=2, alpha=0.5, fill="black")+
+	scale_shape_manual(values=c(21,23))+
+	scale_fill_brewer(palette = "Dark2", aesthetics = c("fill","col"))+
+	standard_theme()+
+	theme(legend.position = "none",
+				panel.spacing =  unit(0, "lines"),
+				strip.text.x = element_blank(),
+				plot.subtitle = ggtext::element_markdown()) +
+	facet_wrap(~treat)+
+	labs(x="Number of interactions", y="(Permutation entropy)^4", tag = "B")
+
+
+m.pe.is <- lmer(pe.transf~mean_mean_abs*treat + (1|ID), data = ddrq1_treat_14_theta5)
+newdat.pe.is <- expand.grid(mean_mean_abs = seq(min(ddrq1_treat_14_theta5$mean_mean_abs),
+																								max(ddrq1_treat_14_theta5$mean_mean_abs),length.out = 200),
+																			 treat = unique(ddrq1_treat_14_theta5$treat))		
+newdat.pe.is$pe.transf <- predict(m.pe.is, newdat.pe.is, re.form=NA)
+mm.pe.is <- model.matrix(terms(m.pe.is),newdat.pe.is)
+pvar1.pe.is <- diag(mm.pe.is %*% tcrossprod(vcov(m.pe.is),mm.pe.is))
+newdat.pe.is <- data.frame(newdat.pe.is,
+															lower.iso=newdat.pe.is$pe.transf-cmult*sqrt(pvar1.pe.is),
+															upper.iso=newdat.pe.is$pe.transf+cmult*sqrt(pvar1.pe.is))
+newdat.pe.is$model <- "pe.is"
+
+
+plot1cPE <- ddrq1_treat_14_theta5 %>%
+  ggplot(aes(x=mean_mean_abs, y=pe.transf, group=treat, shape=treat))+
+  geom_line(data=newdat.pe.is)+
+  geom_ribbon(data=newdat.pe.is, aes(ymax=lower.iso,ymin=upper.iso), alpha=0.2, col=NA) +
+	geom_point(size=2, alpha=0.5, fill="black")+
+	scale_shape_manual(values=c(21,23))+
+	scale_fill_brewer(palette = "Dark2", aesthetics = c("fill","col"))+
+	standard_theme()+
+	theme(legend.position = "right",
+				panel.spacing =  unit(0, "lines"),
+				strip.text.x = element_blank(),
+				plot.subtitle = ggtext::element_markdown()) +
+	facet_wrap(~treat)+
+	labs(x="Mean interaction strength", y="(Permutation entropy)^4", tag = "C", shape="Temperature")
+
+rm(m.pe.rmse,newdat.pe.rmse,mm.pe.rmse,pvar1.pe.rmse,
+	 m.pe.count,newdat.pe.count,mm.pe.count,pvar1.pe.count,
+	 m.pe.is,newdat.pe.is,mm.pe.is,pvar1.pe.is)
+```
+
+
+## MARSS: Species interaction estimation
+
+The code in the following chunk is not executed. Instead the results are then loaded in afterwards
+
+```{r multiview_forecast_analysis_nontarget, message=FALSE, warning=FALSE, cache=TRUE, eval=FALSE}
+interactors <- colnames(dd2[,-c(1:7)])
+nontargets <- interactors[!is.element(interactors,targets)]
+nontargets <- nontargets[c(1,3,4,5)]
+var_pairs <- expand.grid(target=nontargets, interactors=interactors)
+
+dd2_dflist <- split(dd2, dd2$ID)
+
+pairwise_ccm_df_list <- mclapply(dd2_dflist, function(df){
+	dftemp <- df[,-c(1,3:7)]
+	Best_E_df <- apply(var_pairs,1, function(c){
+		best_E_fct(dftemp,c[1],c[2])
+	})
+	
+	Best_E_df <- do.call("rbind",Best_E_df)
+	Best_E_df$ID <- unique(df$ID)
+	Best_E_df$treat <- unique(df$treat)
+	Best_E_df$treat2 <- unique(df$treat2)
+	Best_E_df$treat3 <- unique(df$treat3)
+	
+	rhos <- apply(Best_E_df, 1, function(r){
+		ccm_out <- CCM(dataFrame = dftemp, target = r[1], column = r[2],
+									 libSizes = "10 60 10", Tp = 0, E = as.numeric(r[3]), sample = 100)
+		rho <- ccm_out[6,3]
+		if(rho<0) return(data.frame(rho=rho,comment="negative"))
+		slope <- lm(ccm_out[,3] ~ seq(10,60,by = 10))$coefficients[2]
+		if(slope>=0) {return(data.frame(rho=rho,comment="converged"))
+		} else {return(data.frame(rho=rho,comment="not converged"))}
+	})
+	
+	Best_E_df <- cbind(Best_E_df,do.call("rbind",rhos))
+	
+	rho_df <- Best_E_df %>%
+		dplyr::filter(target %in% nontargets, comment=="converged")
+	
+	significances <- apply(rho_df, 1, function(r){
+		ts <- unlist(df[,as.character(r[2])])
+		# target <- r[2]
+		surr_interactor = SurrogateData(ts, method = "random_shuffle",
+																		num_surr = 1000, alpha = 3)
+		
+		rho_surr <- data.frame(interactor_rho = numeric(1000))
+		
+		interactor_data = as.data.frame(cbind(df$day, ts, surr_interactor))
+		names(interactor_data) = c("day", r[1], paste("T", as.character(seq(1, 1000)),	sep = ""))
+		
+		for (i in 1:1000) {
+			targetCol = paste("T", i, sep = "") 
+			ccm_out = CCM(dataFrame = interactor_data, E = as.numeric(r[3]), Tp = 0, columns = r[1],
+										target = targetCol, libSizes = "60 60 10", sample = 1)
+			col = paste(r[1], ":", targetCol, sep = "")
+			rho_surr$interactor_rho[i] = ccm_out[1, col]
+		}
+		1 - ecdf(rho_surr$interactor_rho)(as.numeric(r["rho"]))
+	})
+	
+	rho_df$significances <- significances
+	pairwise_ccm_df <- full_join(Best_E_df,rho_df)
+	pairwise_ccm_df
+}, mc.cores = detectCores()-2)
+
+pairwise_ccm_df_list_nontargets <- pairwise_ccm_df_list
+save(pairwise_ccm_df_list_nontargets, file = here("Data/CCM_analysis_data/pairwise_ccm_df_list_transf_resid_nontargets.RData"))
+```
+
+
+```{r MARSS_prep, cache=TRUE, message=FALSE, warning=FALSE}
+load(here("Data/CCM_analysis_data/pairwise_ccm_df_list_transf_resid.RData")) # loaded again, same as above
+pairwise_ccm_df <- do.call("rbind",pairwise_ccm_df_list)
+pairwise_ccm_df$interaction <- ifelse(pairwise_ccm_df$significances<0.05 & pairwise_ccm_df$rho>0,T,F)
+pairwise_ccm_df$interaction <- ifelse(pairwise_ccm_df$comment=="not converged",F,pairwise_ccm_df$interaction)
+
+load(here("Data/CCM_analysis_data/pairwise_ccm_df_list_transf_resid_nontargets.RData"))
+pairwise_ccm_df_nontargets <- do.call("rbind",pairwise_ccm_df_list_nontargets)
+pairwise_ccm_df_nontargets$interaction <- ifelse(pairwise_ccm_df_nontargets$significances<0.05 & pairwise_ccm_df_nontargets$rho>0,T,F)
+pairwise_ccm_df_nontargets$interaction <- ifelse(pairwise_ccm_df_nontargets$comment=="not converged",F,pairwise_ccm_df_nontargets$interaction)
+
+pairwise_ccm_df_merged <- rbind(pairwise_ccm_df, pairwise_ccm_df_nontargets)
+
+interaction_matrix_constructor <- function(pairwise, bottle_ID){
+	names <- c(unique(pairwise$target))
+	names_long <- names
+	names <- substr(names, 1, 4)
+	
+	B <- matrix(list(0), length(names), length(names))
+	diag(B) <- names
+	rownames(B) <- colnames(B) <- names
+	
+	bottle <- pairwise %>% dplyr::filter(ID==bottle_ID)
+
+	for(tar in names_long) {
+		for(int in names_long){
+			tar_short <- substr(tar, 1, 4) 
+			int_short <- substr(int, 1, 4)
+			if(tar %in% c("didinium_nasutum","temperature")){
+				B[tar_short,int_short] <- 0
+			} else {
+				interaction <- bottle[bottle$target==tar & bottle$interactor==int,"interaction"]
+				B[tar_short,int_short] <- ifelse(interaction==T,paste(int_short,tar_short,sep = "->"),0)	
+			}
+		}
+	}
+	return(B)
+}
+
+interaction_matrix_constructor_unconstrained <- function(pairwise, bottle_ID){
+  names <- c(unique(pairwise$target))
+  names_long <- names
+  names <- substr(names, 1, 4)
+  
+  B <- matrix(list(0), length(names), length(names))
+  diag(B) <- names
+  rownames(B) <- colnames(B) <- names
+  
+  bottle <- pairwise %>% dplyr::filter(ID==bottle_ID)
+  
+  for(tar in names_long) {
+    for(int in names_long){
+      tar_short <- substr(tar, 1, 4) 
+      int_short <- substr(int, 1, 4)
+      if(tar %in% c("didinium_nasutum","temperature")){
+        B[tar_short,int_short] <- 0
+      } else {
+        # interaction <- bottle[bottle$target==tar & bottle$interactor==int,"interaction"]
+        B[tar_short,int_short] <- paste(int_short,tar_short,sep = "->")	
+      }
+    }
+  }
+  return(B)
+}
+
+names <- c(unique(pairwise_ccm_df_merged$target))
+names_long <- names
+names <- substr(names, 1, 4)
+names_length <- length(names)
+
+R <- matrix(list(0), length(names), length(names))
+diag(R) <- c("flowcyto","flowcam","video","flowcam","flowcam","video","video","manual","flowcam","oxygen","flowcam","flowcam")
+
+Q <- matrix(list(0), names_length, names_length)
+Q[1:(names_length), 1:(names_length)] <- paste(rep(1:(names_length), times = names_length), 
+																									 rep(1:(names_length), each = names_length), sep = "_")
+Q[lower.tri(Q)] <- t(Q)[lower.tri(Q)]
+```
+
+The following chunk is not run. Results loaded in after it.
+
+```{r MARSS, cache=TRUE, message=FALSE, warning=FALSE, eval=FALSE}
+marss.list.Rmeasspecific.Bunconstrained <- mclapply(unique(pairwise_ccm_df_merged$ID), function(id){
+  B <- interaction_matrix_constructor_unconstrained(pairwise = pairwise_ccm_df_merged, bottle_ID = id)
+  
+  marss.model.0 <- list(
+    B = B, U = "zero", Q = Q,
+    Z = "identity", A = "zero", R = R,
+    x0 = "unequal", tinitx = 1
+  )
+  
+  marss_dd <- dd2 %>%
+    dplyr::filter(ID==id) %>%
+    ungroup() %>%
+    dplyr::select(all_of(names_long))
+  
+  colnames(marss_dd) <- names
+  marss_dd <- t(marss_dd)
+  
+  MARSS(marss_dd, model = marss.model.0)
+  
+}, mc.cores = detectCores())
+
+save(marss.list.Rmeasspecific.Bunconstrained, file = here("Data/MARSS_analysis_data/marss.list.Rmeasspecific.Bunconstrained.RData"))
+
+
+marss.list.Rmeasspecific.Bconstrained <- mclapply(unique(pairwise_ccm_df_merged$ID), function(id){
+  B <- interaction_matrix_constructor(pairwise = pairwise_ccm_df_merged, bottle_ID = id)
+
+  marss.model.0 <- list(
+    B = B, U = "zero", Q = Q,
+    Z = "identity", A = "zero", R = R,
+    x0 = "unequal", tinitx = 1
+  )
+  
+  marss_dd <- dd2 %>%
+    dplyr::filter(ID==id) %>%
+    ungroup() %>%
+    dplyr::select(all_of(names_long))
+  
+  colnames(marss_dd) <- names
+  marss_dd <- t(marss_dd)
+  
+  MARSS(marss_dd, model = marss.model.0)
+  
+}, mc.cores = detectCores())
+
+save(marss.list.Rmeasspecific.Bconstrained, file = here("Data/MARSS_analysis_data/marss.list.Rmeasspecific.Bconstrained.RData"))
+```
+
+```{r MARSS2, cache=TRUE, message=FALSE, warning=FALSE}
+load(here("Data/MARSS_analysis_data/marss.list.Rmeasspecific.Bconstrained.RData")) # B constrained, R based on measurement method, did and temp excluded
+load(here("Data/MARSS_analysis_data/marss.list.Rmeasspecific.Bunconstrained.RData")) # B completely unconstrained, R based on measurement method, did and temp excluded
+
+Bs <- lapply(marss.list.Rmeasspecific.Bconstrained, function(m){
+	B<- coef(m, type = "matrix")$B
+	rownames(B) <- colnames(B) <- names
+	B 
+})
+
+Bs.Rmeasspecific.Bunconstrained <- lapply(marss.list.Rmeasspecific.Bunconstrained, function(m){
+	B<- coef(m, type = "matrix")$B
+	rownames(B) <- colnames(B) <- names
+	B
+})
+
+ddrq1_treat_marss_list <- split(ddrq1_treat_14_theta5, ddrq1_treat_14_theta5$ID)
+
+for(i in 1:18){
+	B <- Bs[[i]]
+	ddrq1_treat_marss_list[[i]]$marss <- rowSums(abs(B))[1:8]
+	ddrq1_treat_marss_list[[i]]$marss <- ddrq1_treat_marss_list[[i]]$marss/ddrq1_treat_marss_list[[i]]$count
+
+	B <- Bs.Rmeasspecific.Bunconstrained[[i]]
+	ddrq1_treat_marss_list[[i]]$marss.Rmeasspecific.Bunconstrained <- rowSums(abs(B))[1:8]/nrow(B)
+}
+
+ddrq1_treat_marss <- do.call("rbind",ddrq1_treat_marss_list) %>%
+  mutate(treat = ifelse(treat %in% c("const","Constant"),"Constant","Fluctuating"),
+         Target2 = label[Target],
+         smap = mean_mean_abs)
+
+ddrq1_treat_marss_long <- ddrq1_treat_marss %>%
+	pivot_longer(cols = c("marss","marss.Rmeasspecific.Bunconstrained","mean_mean_abs"), 
+	             names_to = "Method", values_to = "interaction_estimate") %>%
+  mutate(Method = ifelse(Method=="marss",
+                         "MARSS based on CCM interactions",
+                         ifelse(Method=="marss.Rmeasspecific.Bunconstrained",
+                                "MARSS based on all interactions",
+                                "S-map based on CCM interactions")))
+
+m.mars.smap.1 <- lmer(marss~smap*treat + (1|ID), data = ddrq1_treat_marss)
+newdat.mars.smap.1 <- expand.grid(smap = seq(min(ddrq1_treat_marss$smap),
+                                             max(ddrq1_treat_marss$smap),length.out = 200),
+                                  treat = unique(ddrq1_treat_marss$treat))		
+newdat.mars.smap.1$marss <- predict(m.mars.smap.1, newdat.mars.smap.1, re.form=NA)
+mm.mars.smap.1 <- model.matrix(terms(m.mars.smap.1),newdat.mars.smap.1)
+pvar1.mars.smap.1 <- diag(mm.mars.smap.1 %*% tcrossprod(vcov(m.mars.smap.1),mm.mars.smap.1))
+newdat.mars.smap.1 <- data.frame(newdat.mars.smap.1,
+                                 lower=newdat.mars.smap.1$marss-cmult*sqrt(pvar1.mars.smap.1),
+                                 upper=newdat.mars.smap.1$marss+cmult*sqrt(pvar1.mars.smap.1))
+
+m.mars.smap.2 <- lmer(marss.Rmeasspecific.Bunconstrained~smap*treat + (1|ID), data = ddrq1_treat_marss)
+newdat.mars.smap.2 <- expand.grid(smap = seq(min(ddrq1_treat_marss$smap),
+																			 max(ddrq1_treat_marss$smap),length.out = 200),
+														treat = unique(ddrq1_treat_marss$treat))		
+newdat.mars.smap.2$marss.Rmeasspecific.Bunconstrained <- predict(m.mars.smap.2, newdat.mars.smap.2, re.form=NA)
+mm.mars.smap.2 <- model.matrix(terms(m.mars.smap.2),newdat.mars.smap.2)
+pvar1.mars.smap.2 <- diag(mm.mars.smap.2 %*% tcrossprod(vcov(m.mars.smap.2),mm.mars.smap.2))
+newdat.mars.smap.2 <- data.frame(newdat.mars.smap.2,
+															lower=newdat.mars.smap.2$marss.Rmeasspecific.Bunconstrained-cmult*sqrt(pvar1.mars.smap.2),
+															upper=newdat.mars.smap.2$marss.Rmeasspecific.Bunconstrained+cmult*sqrt(pvar1.mars.smap.2))
+
+newdat.mars.smap <- full_join(newdat.mars.smap.1,newdat.mars.smap.2)
+
+newdat.mars.smap <- newdat.mars.smap %>%
+	pivot_longer(cols = c("marss","marss.Rmeasspecific.Bunconstrained"), 
+	             names_to = "Method", values_to = "interaction_estimate") %>%
+	na.omit()
+
+newdat.mars.smap$Method <- ifelse(newdat.mars.smap$Method=="marss",
+																	"MARSS based on CCM interactions",
+																	"MARSS based on all interactions")
+
+marsplot1 <- ddrq1_treat_marss_long %>%
+	dplyr::filter(Method != "S-map based on CCM interactions") %>%
+  ggplot(aes(smap, interaction_estimate, group=treat, shape=treat, fill=Method, col=Method))+
+	geom_abline(slope = 1, intercept = 0) +
+  geom_point(size=2, alpha=0.33)+
+	scale_shape_manual(values=c(21,23))+
+	scale_fill_brewer(palette = "Dark2", aesthetics = c("fill","col"))+
+  standard_theme()+
+  geom_line(aes(group=Method),data=newdat.mars.smap)+
+  geom_ribbon(data=newdat.mars.smap, aes(ymax=upper,ymin=lower, group=Method), 
+  						alpha=0.2, col=NA) +
+	facet_wrap(~treat)+
+	theme(legend.position = "none",
+				panel.spacing =  unit(0, "lines"),
+				strip.text.x = element_blank(),
+				plot.subtitle = ggtext::element_markdown()) +
+	labs(x="s-map", y="marss")  + 
+	labs(y="MARSS interaction strength", x="S-map interaction strength", tag = "D", 
+			 shape="Temperature", col="Estimation method", fill="Estimation method")
+
+
+m.mars.rmse.1 <- lmer(RMSE~marss*treat + (1|ID), data = ddrq1_treat_marss)
+newdat.mars.rmse.1 <- expand.grid(marss = seq(min(ddrq1_treat_marss$marss),
+																							max(ddrq1_treat_marss$marss),length.out = 200),
+																	treat = unique(ddrq1_treat_marss$treat))		
+newdat.mars.rmse.1$RMSE <- predict(m.mars.rmse.1, newdat.mars.rmse.1, re.form=NA)
+mm.mars.rmse.1 <- model.matrix(terms(m.mars.rmse.1),newdat.mars.rmse.1)
+pvar1.mars.rmse.1 <- diag(mm.mars.rmse.1 %*% tcrossprod(vcov(m.mars.rmse.1),mm.mars.rmse.1))
+newdat.mars.rmse.1 <- data.frame(newdat.mars.rmse.1,
+																 lower=newdat.mars.rmse.1$RMSE-cmult*sqrt(pvar1.mars.rmse.1),
+																 upper=newdat.mars.rmse.1$RMSE+cmult*sqrt(pvar1.mars.rmse.1))
+
+m.mars.rmse.2 <- lmer(RMSE~marss.Rmeasspecific.Bunconstrained*treat + (1|ID), data = ddrq1_treat_marss)
+newdat.mars.rmse.2 <- expand.grid(marss.Rmeasspecific.Bunconstrained = seq(min(ddrq1_treat_marss$marss.Rmeasspecific.Bunconstrained),
+																																					 max(ddrq1_treat_marss$marss.Rmeasspecific.Bunconstrained),length.out = 200),
+																	treat = unique(ddrq1_treat_marss$treat))		
+newdat.mars.rmse.2$RMSE <- predict(m.mars.rmse.2, newdat.mars.rmse.2, re.form=NA)
+mm.mars.rmse.2 <- model.matrix(terms(m.mars.rmse.2),newdat.mars.rmse.2)
+pvar1.mars.rmse.2 <- diag(mm.mars.rmse.2 %*% tcrossprod(vcov(m.mars.rmse.2),mm.mars.rmse.2))
+newdat.mars.rmse.2 <- data.frame(newdat.mars.rmse.2,
+																 lower=newdat.mars.rmse.2$RMSE-cmult*sqrt(pvar1.mars.rmse.2),
+																 upper=newdat.mars.rmse.2$RMSE+cmult*sqrt(pvar1.mars.rmse.2))
+
+newdat.mars.rmse <- full_join(newdat.mars.rmse.1,newdat.mars.rmse.2)
+
+newdat.mars.rmse <- newdat.mars.rmse %>%
+	pivot_longer(cols = c("marss","marss.Rmeasspecific.Bunconstrained"),
+	             names_to = "Method", values_to = "interaction_estimate") %>%
+	na.omit()
+
+newdat.mars.rmse$Method <- ifelse(newdat.mars.rmse$Method=="marss",
+																	"MARSS based on CCM interactions",
+																	"MARSS based on all interactions")
+
+newdat_theta5 <- newdat_thetas %>% dplyr::filter(theta==5) %>%
+	dplyr::select(treat, RMSE, lower.mean_mean_abs, upper.mean_mean_abs,mean_mean_abs) %>%
+	dplyr::rename(lower=lower.mean_mean_abs, upper=upper.mean_mean_abs, interaction_estimate=mean_mean_abs) %>%
+	na.omit()
+newdat_theta5$Method <- "S-map based on CCM interactions"
+
+newdat.mars.rmse <- full_join(newdat.mars.rmse,newdat_theta5)
+
+marsplot2 <- ddrq1_treat_marss_long %>%
+  ggplot(aes(interaction_estimate,RMSE, group=treat, shape=treat, fill=Method, col=Method))+
+  geom_line(aes(group=Method),data=newdat.mars.rmse)+
+  geom_ribbon(data=newdat.mars.rmse, aes(ymax=upper,ymin=lower, group=Method), 
+  						alpha=0.2, col=NA) +
+	geom_point(size=2, alpha=0.33)+
+	scale_shape_manual(values=c(21,23))+
+	scale_fill_brewer(palette = "Dark2", aesthetics = c("fill","col"))+
+  standard_theme()+
+  facet_wrap(~treat)+
+	theme(legend.position = "right",
+				panel.spacing =  unit(0, "lines"),
+				strip.text.x = element_blank(),
+				plot.subtitle = ggtext::element_markdown()) +
+	labs(x="Mean interaction strength (MARSS)", y="RMSE", tag="E",
+			 shape="Temperature", col="Estimation method", fill="Estimation method")
+
+rm(m.mars.smap.1,newdat.mars.smap.1,mm.mars.smap.1,pvar1.mars.smap.1,
+	 m.mars.smap.2,newdat.mars.smap.2,mm.mars.smap.2,pvar1.mars.smap.2,newdat.mars.smap,
+	 m.mars.rmse.1,newdat.mars.rmse.1,mm.mars.rmse.1,pvar1.mars.rmse.1,
+	 m.mars.rmse.2,newdat.mars.rmse.2,mm.mars.rmse.2,pvar1.mars.rmse.2,newdat.mars.rmse)
+```
+
+## Other 
+
+### Forecast skill across bottles
+
+```{r bottle_forecasts, cache=TRUE, message=FALSE, warning=FALSE}
+ranef.mv2 <- ranef(m.mv2, condVar=TRUE)[[1]]
+
+ranef.mv2 <- data.frame(Target.ID=rownames(ranef.mv2),
+                  int=unname(ranef.mv2),
+                  se=sqrt(c(attr(ranef.mv2,"postVar"))))
+
+Target.ID <- strsplit(rownames(ranef.mv2),":")
+ranef.mv2$Target <- unlist(map(Target.ID, 1))
+ranef.mv2$ID <- unlist(map(Target.ID, 2))
+ranef.mv2 <- transform(ranef.mv2,ID=reorder(ID,int))
+ranef.mv2$Target2 <- label[as.character(ranef.mv2$Target)]
+
+ranef.plot.list <- lapply(unique(ranef.mv2$Target), function(tar){
+	ranef.mv2 %>%
+		dplyr::filter(Target==tar) %>%
+		mutate(ID=reorder(ID,int)) %>%
+		ggplot(aes(ID,int,ymin=int-1.96*se,ymax=int+1.96*se)) +
+		geom_hline(yintercept = 0) +
+		geom_pointrange() +
+		standard_theme2() +
+		theme(strip.text = ggtext::element_markdown()) +
+		facet_wrap(~Target2)+
+		ylim(-.4,.4) +
+		coord_flip()+
+		labs(y="Intercept", x="Bottle ID") 
+})
+
+ranef.mv2 <- ranef.mv2 %>%
+	group_by(Target) %>%
+	mutate(rank = factor(rank(int), ordered = T, levels = 1:18))
+
+ranef.mv2 <- ranef.mv2 %>%
+	ungroup() %>%
+	group_by(ID) %>%
+	mutate(mean_rank=mean(as.numeric(rank)))
+
+ranef.mv2_summarized <- ranef.mv2 %>%
+	group_by(ID) %>%
+	summarise(mean_intercept = mean(int),
+						sd_intercept = sd(int))
+
+ranef.mv2_summarized$facet <- "Across all targets"
+bottle.mean.plot <- ranef.mv2_summarized %>% 
+  ggplot(aes(ID, mean_intercept, ymin=mean_intercept-sd_intercept,
+             ymax=mean_intercept+sd_intercept)) +
+  geom_pointrange() +
+	geom_hline(yintercept = 0) +
+	coord_flip() +
+	facet_wrap(~facet) +
+	labs(y="Intercept", x="Bottle ID") +
+	standard_theme2()
+```
+
+### Choosing k 
+
+The following chunk is not run, results are loaded in later on.
+
+```{r choose_k, cache=TRUE, message=FALSE, warning=FALSE, eval=FALSE}
+possible_predictors <- c("bacteria","chlamydomonas_reinhardtii","colpidium_striatum",
+                         "dexiostomata_campylum", "euglena_gracilis", "euplotes_daidaleos",
+                         "paramecium_caudatum", "rotifer_sp")
+ids <- c("B01","B04","B07","B10","B13","B16")
+output <- data.frame(target=character(),k=numeric(),rmse=numeric(),ID=character())
+set.seed(32)
+k <- seq(5,200,by = 5)
+cl <- makeCluster(detectCores()-1)
+registerDoParallel(cl = cl)
+for(i in possible_predictors){
+  for(j in ids){
+    predictors <- sample(possible_predictors[possible_predictors!=i], 4, replace = F)
+    predictors <- c(i,predictors)
+    ddtest <- dd2 %>% ungroup() %>% dplyr::filter(ID == j) %>% select(predictors)
+    columns <- paste(predictors, collapse = " ")
+
+    test_list <- foreach(x = seq(5,200,by = 5), .packages = loadedNamespaces(),
+                         .export = ls(globalenv())) %dopar% {
+      mv_wrapper(data = ddtest, k = x, columns = columns, target = i, E = 3,
+                 max_lag = 3, excludeTarget = F)}
+    test_list2 <- lapply(test_list, "[[", 2)
+    rmse <- sapply(test_list2,
+                   function(x) sqrt(mean((x$Observations-x$Predictions)^2,
+                                         na.rm = T)))
+    output <- rbind(output,data.frame(target=i,k=k,rmse=rmse,ID=j))
+  }
+}
+stopCluster(cl)
+
+output$target <- as.character(output$target)
+
+dd_choose_k <- output %>%
+  group_by(target,ID) %>%
+  mutate(perc_change = lag(100*(rmse-lead(rmse))/rmse))
+
+save(dd_choose_k, file = here("Data/Multiview_forecast_data/dd_choose_k.Rdata"))
+```
+
+
+### Predictor importance for targets Euglena and Chlamydomonas
+
+```{r}
+m.pred.imp.eug <- lmer(RMSE~log10.mean.abs*treat + (1|ID),
+                       data = ddrq1_importance %>% dplyr::filter(target=="euglena_gracilis"))
+m.pred.imp.chl <- lmer(RMSE~log10.mean.abs*treat + (1|ID), 
+                       data = ddrq1_importance %>% dplyr::filter(target=="chlamydomonas_reinhardtii"))
+# summary(m.pred.imp.eug)
+# summary(m.pred.imp.chl)
+
+
+predimport.eug.chla.tab <- data.frame(Target=c(rep("\\textit{E. gracilis}",5),rep("\\textit{C. reinhardtii}",5)),
+                                      Covariate = c("Intercept","A: log10(mean int. strength)",
+                                                    "B: Fluctuating temperature", "Interaction: A:B","Bottle ID",
+                                                    "Intercept}","A: log10(mean int. strength)",
+                                                    "B: Fluctuating temperature}", "Interaction: A:B","Bottle ID"),
+                                      Type = rep(c(rep("Fixed",4),"Std. Dev."),2),
+                                      Coefficient = c(fixef(m.pred.imp.eug),as.data.frame(VarCorr(m.pred.imp.eug))$sdcor[1],
+                                                      fixef(m.pred.imp.chl),as.data.frame(VarCorr(m.pred.imp.chl))$sdcor[1]),
+                                      Std.err = c(summary(m.pred.imp.eug)$coef[,2,drop = FALSE],NA,
+                                                  summary(m.pred.imp.chl)$coef[,2,drop = FALSE],NA),
+                                      Test = rep(c(rep("\\textit{t}",4),"$\\chi^2$"),2),
+                                      Test.value = c(summary(m.pred.imp.eug)$coef[,4,drop = FALSE],lmerTest::rand(m.pred.imp.eug)$LRT[2],
+                                                     summary(m.pred.imp.chl)$coef[,4,drop = FALSE],lmerTest::rand(m.pred.imp.chl)$LRT[2]),
+                                      p.value = c(summary(m.pred.imp.eug)$coef[, 5, drop = FALSE],lmerTest::rand(m.pred.imp.eug)$`Pr(>Chisq)`[2],
+                                                  summary(m.pred.imp.chl)$coef[, 5, drop = FALSE],lmerTest::rand(m.pred.imp.chl)$`Pr(>Chisq)`[2]))
+```
+
+
+### Alternative analysis of predictor importance 1
+
+```{r multiview_forecast_analysis_13, message=FALSE, warning=FALSE, cache=TRUE, eval=FALSE}
+possible_predictors <- c("bacteria","chlamydomonas_reinhardtii","colpidium_striatum",
+                         "dexiostomata_campylum", "didinium_nasutum",
+                         "euglena_gracilis","euplotes_daidaleos","paramecium_caudatum",
+                         "rotifer_sp","big_white_particle","dissolved_oxygen",
+                         "green_white_particle", "small_white_particle",
+                         "temperature")
+
+predictor_combinations <- predictor_combinator(possible_predictors, which=13, rmTfrompred = F, temperature.included = F)
+
+ks <- unique(round(exp(seq(log(0.8),log(100.4),length.out = 33))))
+
+dd2 <- dd2 %>% ungroup()
+set.seed(98)
+
+dd_forecast13 <- lapply(targets, function(target){
+  df1 <- model_fitter_wrapper(whole.data = dd2, 
+                              predictor_combinations = predictor_combinations,
+                              target = target,
+                              num.clusters = detectCores() - 1, 
+                              E = 3, max_lag = 3, k=ks)
+})
+
+dd_forecast13 <- do.call("rbind", dd_forecast13)
+
+dd_forecast13$predictor_combination <- as.character(dd_forecast13$predictor_combination)
+temp <- matrix(F, nrow = nrow(dd_forecast13), ncol = length(possible_predictors))
+colnames(temp) <- possible_predictors
+dd_forecast13 <- cbind(dd_forecast13,temp)
+
+dd_forecast13 <- as.data.frame(t(apply(dd_forecast13, 1, function(row) { 
+  str <- unlist(strsplit(row["predictor_combination"], " "))
+  row[str] <- T
+  row
+})))
+
+dd_forecast13$num_pred <- as.numeric(dd_forecast13$num_pred)
+dd_forecast13$num_pred_without_temp <- as.numeric(dd_forecast13$num_pred_without_temp)
+dd_forecast13$RMSE <- as.numeric(dd_forecast13$RMSE)
+dd_forecast13$k <- as.numeric(dd_forecast13$k)
+for(i in possible_predictors){  dd_forecast13[,i] <- as.logical(dd_forecast13[,i])}
+
+save(dd_forecast13, file = here("Data/Multiview_forecast_data/dd_forecast13.RData"))
+```
+
+```{r multiview_forecast_analysis_13_2, message=FALSE, warning=FALSE, cache=TRUE}
+load(here("Data/Multiview_forecast_data/dd_forecast13.RData"))
+
+possible_predictors <- c("bacteria","chlamydomonas_reinhardtii","colpidium_striatum",
+                         "dexiostomata_campylum", "didinium_nasutum",
+                         "euglena_gracilis","euplotes_daidaleos","paramecium_caudatum",
+                         "rotifer_sp","big_white_particle","dissolved_oxygen",
+                         "green_white_particle", "small_white_particle",
+                         "temperature")
+
+dd_forecast13$excluded_predictor <- apply(dd_forecast13, 1, function(row){
+  s <- unlist(strsplit(row["predictor_combination"]," "))
+  idx <- which(possible_predictors %in% s)
+  possible_predictors[-idx]
+})
+
+
+# rmse.full <- ddrq1[ddrq1$num_pred==14, "RMSE"]
+
+dd_forecast13$RMSE_dif <- NA
+dd_forecast13.split <- split(dd_forecast13, f=dd_forecast13$ID)
+dd_forecast13.split <- lapply(dd_forecast13.split, function(df){
+  bottle <- unique(df$ID)
+  df <- apply(df, 1, function(row){
+    tar <- row["Target"]
+    rmse.full <- ddrq1[ddrq1$num_pred==14 & ddrq1$ID==bottle & ddrq1$Target==tar, "RMSE"]
+    row["RMSE_dif"] <- as.numeric(row["RMSE"]) - rmse.full
+    row
+  })
+  df <- as.data.frame(t(df))
+  df
+})
+dd_forecast13 <- do.call("rbind", dd_forecast13.split)
+dd_forecast13$RMSE_dif <- as.numeric(dd_forecast13$RMSE_dif)
+dd_forecast13$target <- dd_forecast13$Target
+dd_forecast13$interactor <- dd_forecast13$excluded_predictor
+dd_forecast13 <- inner_join(dd_forecast13, dd_mean_is)
+dd_forecast13$log10.mean.abs <- log10(dd_forecast13$mean.abs)
+dd_forecast13$treat <- ifelse(dd_forecast13$treat=="const","Constant","Fluctuating")
+dd_forecast13$interactor <- factor(label[dd_forecast13$interactor], levels = order.interactors)
+dd_forecast13$Target <- factor(label[dd_forecast13$Target], levels = order.targets)
+```
+
+### CCM vs mean interaction strength
+
+```{r ccm.int.strength, fig.width=13, fig.height=4, out.width="95%", cache=TRUE, message=FALSE}
+significant_pairwise_ccm_df <- pairwise_ccm_df %>%
+	dplyr::filter(significances<0.05, rho >0)
+
+ddrq1_importance2 <- significant_pairwise_ccm_df %>%
+	dplyr::mutate(Target=as.factor(label[target]),
+								interactor=as.factor(label[interactor])) %>%
+	dplyr::select(Target,ID,rho,interactor)
+
+ddrq1_importance2 <- dplyr::full_join(ddrq1_importance,ddrq1_importance2)
+
+ccm.int.strength.list <- split(ddrq1_importance2, ddrq1_importance2$Target)
+
+ccm.int.strength.list <- lapply(1:length(ccm.int.strength.list), function(i){
+	df <- ccm.int.strength.list[[i]]
+	nd <- newdat.m.pred.imp %>% dplyr::filter(Target==unique(df$Target))
+	plot <- df %>%
+		ggplot(aes(rho,log10.mean.abs, shape=treat))+
+		geom_point(aes(fill=interactor),size=2, col="black")+
+		facet_wrap(~treat, ncol = 4) +
+		geom_smooth() +
+		labs(subtitle = unique(df$Target), tag=tag[i], x=expression('log'[10]~"(Mean interaction strength)")) +
+		scale_shape_manual(values=c(21,23))+
+		scale_color_manual(breaks = levels(ddrq1_importance2$interactor),
+											 values = palette2, aesthetics = c("fill","color"))+
+		standard_theme() +
+		theme(legend.position = "none",
+					panel.spacing =  unit(0, "lines"),
+					axis.title = element_blank(),
+					strip.text.x = element_blank(),
+					legend.text = ggtext::element_markdown(),
+					plot.subtitle = ggtext::element_markdown()) +
+    guides(col=guide_legend(ncol=2))
+	
+	# if(unique(df$target) %in% c("chlamydomonas_reinhardtii","euglena_gracilis")){
+	# 	plot <- plot + 	
+	# 		geom_ribbon(data=nd, aes(ymin=lower, ymax=upper, y=RMSE), alpha=0.2, col=NA)+
+	# 		geom_line(data=nd, aes(log10.mean.abs,RMSE))
+	# }
+	plot
+})
+
+ccm.int.strengthleg <- ddrq1_importance2 %>%
+	ggplot(aes(rho, log10.mean.abs,shape=treat))+
+	geom_point(aes(col=interactor,fill=interactor),size=2,)+
+	facet_wrap(~treat, ncol = 4) +
+	scale_color_manual(breaks = levels(ddrq1_importance2$interactor),
+										 values = palette2, aesthetics = c("fill","color"))+
+	standard_theme() +
+	scale_shape_manual(values=c(21,23))+
+	theme(legend.position = "right",
+				panel.spacing =  unit(0, "lines"),
+				strip.text.x = element_blank(),
+				legend.text = ggtext::element_markdown(size = 11),
+				plot.subtitle = ggtext::element_markdown()) +
+	labs(shape="Temperature", fill= "Interactor/Predictor", col="Interactor/Predictor") +
+	geom_smooth(method = "lm")+
+	guides(col=guide_legend(ncol=2))
+
+ccm.int.strengthleg <- get_legend(ccm.int.strengthleg)
+
+ylab <- ggplot(data.frame(x = 1, y = 1)) +
+	geom_text(aes(x, y), label = expression('    log'[10]~"(Mean interaction strength)"), angle = 90, size=6) +
+	theme_void() +
+	coord_cartesian(clip = "off")
+
+xlab <- ggplot(data.frame(x = 1, y = 1)) +
+	geom_text(aes(x, y), label = "Cross mapping skill (CCM)", size=6) +
+	theme_void() +
+	coord_cartesian(clip = "off")
+
+ccm.int.strength.plot <- ((ylab + ((Reduce("+", ccm.int.strength.list) + plot_layout(ncol = 2)) / xlab + plot_layout(heights = c(50,1))) + ccm.int.strengthleg + plot_layout(widths = c(2,80,20))))
+```
+
+
+
+# Supplementary material: Figures and tables
+
+General note on tables: their code was written for latex, meaning that some properties will not be displayed correctly in markdown.
+
+## Regression and anova tables of the main text
+
+```{r rq1tab, cache=TRUE}
+tab.rq1.theta5$p.value <- ifelse(tab.rq1.theta5$p.value<0.001, "<0.001",
+																 sprintf("%.3f", round(tab.rq1.theta5$p.value,3)))
+options(knitr.kable.NA = '-')
+tab.rq1.theta5 %>%
+	dplyr::select(-theta) %>%
+	mutate_all(linebreak, align="l") %>%
+	kable(booktabs = T, digits = 3,
+				col.names = c("Response", "Covariate" ,"Type", "Coefficient", "Std. Err.", "Test", "Value", "\\textit{p}-value"),
+				caption = "The main regression table for the four models fitted respectively for the relation between the forecast RMSE and the number of interactions, between the forecast RMSE and the mean interaction strength, between the mean interaction strength and the number of interactions as well as between the forecast RMSE and the sum of interaction strengths.",
+				align = c("lllrrlrr"), escape = F,
+				label = "rq1tab") %>%
+	collapse_rows(columns = 1, latex_hline ='custom', custom_latex_hline = 1,
+								valign = "middle")%>%
+	kable_styling(font_size = 7,latex_options = "hold_position")
+```
+
+
+```{r mv.tab, cache = TRUE}
+mv.tab$p.value <- ifelse(mv.tab$p.value<0.001, "<0.001",
+												 sprintf("%.3f", round(mv.tab$p.value,3)))
+options(knitr.kable.NA = '-')
+rownames(mv.tab) <- NULL 
+kable(mv.tab,
+			booktabs = T, digits = 3,
+			col.names = c("Covariate","Type","Estimate","DF","Std. Err.", "Test", "Value", "\\textit{p}-value"),
+			caption = "Regression and anova combination table for the mixed effects model of forecast skill as a function of the number of predictors, temperature regime and whether temperature was used as a predictor or not.", align = c("llrrrcrr"), escape = F,
+			label = "rqtab1")%>% 
+	kable_styling(font_size = 7) %>%
+	pack_rows("D: Target species", 5, 11, bold = T) %>%
+	pack_rows("Interaction: B:D", 15, 21, bold = T) %>%
+	pack_rows("Interaction: A:D", 22, 28, bold = T) %>%
+	pack_rows("Interaction: C:D", 29, 35, bold = T) %>%
+	row_spec(35, hline_after = T) %>%
+	row_spec(45, hline_after = T) 
+```
+
+```{r tab.num_vs_num, cache = TRUE}
+tab.num_vs_num$p.value <- ifelse(tab.num_vs_num$p.value<0.001, "<0.001",
+												 sprintf("%.3f", round(tab.num_vs_num$p.value,3)))
+rownames(tab.num_vs_num) <- NULL
+options(knitr.kable.NA = '-')
+
+kable(tab.num_vs_num,
+			booktabs = T, digits = 3,
+			col.names = c("Covariate","Variable type","Coefficient","Std. Err.", "Test", "Value", "\\textit{p}-value"),
+			caption = "The regression table for the mixed model with the number of predictors in the best focast model as the repsonse variable and the number of interaction as the explanatory variable.", align = c("llrrcrr"), escape = F,
+			label = "num_vs_num")%>%
+	kable_styling(font_size = 7)
+```
+
+```{r mv.interactopredictor, cache = TRUE}
+mv.interactopredictor$p.value <- ifelse(mv.interactopredictor$p.value<0.001, "<0.001",
+												 sprintf("%.3f", round(mv.interactopredictor$p.value,3)))
+rownames(mv.interactopredictor) <- NULL
+options(knitr.kable.NA = '-')
+
+kable(mv.interactopredictor,
+			booktabs = T, digits = 3,
+			col.names = c("Covariate","Type","Estimate","DF","Std. Err.", "Test", "Value", "\\textit{p}-value"),
+			caption = "Regression and anova combination table for the mixed effects that assessed whether species that interacted strongly witha a target species also were good predictors of said target species.", align = c("llrcrr"), escape = F,
+			label = "predictor_interactor")%>%
+	kable_styling(font_size = 7)  %>%
+	pack_rows("C: Target species", 4, 10, bold = T) %>%
+	pack_rows("Interaction: A:C", 12, 18, bold = T) %>%
+	pack_rows("Interaction: B:C", 19, 25, bold = T) %>%
+	pack_rows("Interaction: A:B:C", 26, 32, bold = T) %>%
+	row_spec(32, hline_after = T) %>%
+	row_spec(39, hline_after = T) 
+```
+
+## Experiment supplementary information
+
+### Temperature time series
+
+```{r temperature_plot, fig.width=8, fig.height=2.5, out.width="95%"}
+temperature.df <- dd %>%
+	dplyr::filter(variable=="temperature", 
+								ID %in% c("B01","B10","B13","B16")) %>%
+	dplyr::mutate(response = case_when(treat=="treat" ~ response,
+																		 treat!="treat" ~ 17.3))
+
+temperature.df$ID <- ifelse(temperature.df$ID=="B01", "Constant temperature",
+                ifelse(temperature.df$ID=="B16", "Fluctuating temperature\ntime series 1 (original)",
+                       ifelse(temperature.df$ID=="B13","Fluctuating temperature\ntime series 2 (synthetic)",
+                              "Fluctuating temperature\ntime series 3 (synthetic)")))
+
+temperature.df %>%
+  ggplot(aes(day,response)) +
+  geom_line()+
+  facet_wrap(~ID, ncol = 4) +
+  theme_bw() +
+  theme(legend.position = "none",
+        panel.grid.major = element_blank(),
+        panel.grid.minor = element_blank(),
+        strip.background = element_blank(),
+        panel.border = element_rect(colour = "black"),
+        strip.text = element_text(size=10)) +
+  labs(y="Temperature (°C)",x="Time (days)")
+```
+
+### Recorded time series
+
+```{r plot_original_ts, fig.width=11, fig.height=13, out.width="95%", cache=TRUE}
+vars <- c("bacteria", "chlamydomonas_reinhardtii", "colpidium_striatum", "dexiostomata_campylum",
+					"didinium_nasutum", "euglena_gracilis", "euplotes_daidaleos", "paramecium_caudatum",
+					"rotifer_sp", "big_white_particle", "small_white_particle", "green_white_particle",
+					"spirostomum_sp","dissolved_oxygen")
+
+dd_plot <- dd %>%
+	dplyr::filter(variable %in% vars) %>%
+	mutate(treat2 = case_when(treat2 == "constant_1" ~ "Constant 1",
+                            treat2 == "constant_2" ~ "Constant 2",
+                            treat2 == "constant_3" ~ "Constant 3",
+                            treat2 == "fluctuating_1" ~ "Fluctuating 1",
+                            treat2 == "fluctuating_2" ~ "Fluctuating 2",
+                            treat2 == "fluctuating_3" ~ "Fluctuating 3"))
+
+dd_plot$order <- factor(dd_plot$variable, levels = vars) 
+dd_plot <- dd_plot[order(dd_plot$order),] 
+dd_plot_list <- split(dd_plot, dd_plot$order)
+
+dd_plot_list <- lapply(1:length(dd_plot_list), function(i){
+  df <- dd_plot_list[[i]]
+  df <- df %>%
+    ggplot(aes(day, response, col=treat2, group=ID))+
+    geom_line()+
+    facet_wrap(~treat) +
+    labs(x="Time (days)", subtitle = label[unique(df$variable)], y="Density\n(cells/ml)",
+    		 col="Temperature", tag = tag[i]) +
+    theme_bw() +
+    standard_theme() +
+    scale_color_brewer(palette = "Dark2")+
+    theme(legend.position = "none",
+          panel.spacing =  unit(0, "lines"),
+          strip.text.x = element_blank(),
+    			plot.subtitle = ggtext::element_markdown()) +
+    guides(col=guide_legend(ncol=2))
+
+  if(i %in% c(2,4,6,8,10,12)){
+    df <- df + theme(axis.title = element_blank(), axis.text.x = element_blank(), axis.ticks.x=element_blank())
+  }
+  if(i == 14){
+    df <- df + theme(axis.title.y = element_blank(),
+                     legend.position = "bottom")
+  }
+  if(i %in% c(1,3,5,7,9,11)){
+    df <- df + theme(axis.title.x = element_blank(), axis.text.x = element_blank(), axis.ticks.x=element_blank())
+  }
+  df
+})
+
+plot_original_leg <- get_legend(dd_plot_list[[14]])
+dd_plot_list[[14]] <- dd_plot_list[[14]] + theme(legend.position = "none")
+
+(Reduce("+", dd_plot_list) + plot_layout(ncol = 2))/(plot_original_leg) + plot_layout(heights = c(11,1))
+```
+
+Transformed time series
+
+```{r plot_original_ts_transf, fig.width=11, fig.height=13, out.width="95%", cache=TRUE, warning=FALSE, message=FALSE}
+vars <- c("bacteria", "chlamydomonas_reinhardtii", "colpidium_striatum", "dexiostomata_campylum",
+					"didinium_nasutum", "euglena_gracilis", "euplotes_daidaleos", "paramecium_caudatum",
+					"rotifer_sp", "big_white_particle", "small_white_particle", "green_white_particle",
+					"temperature","dissolved_oxygen")
+ 
+dd_plot <- dd2_long %>% 
+	dplyr::filter(variable %in% vars) %>%
+	mutate(treat2 = case_when(treat2 == "constant_1" ~ "Constant 1",
+                            treat2 == "constant_2" ~ "Constant 2",
+                            treat2 == "constant_3" ~ "Constant 3",
+                            treat2 == "fluctuating_1" ~ "Fluctuating 1",
+                            treat2 == "fluctuating_2" ~ "Fluctuating 2",
+                            treat2 == "fluctuating_3" ~ "Fluctuating 3"))
+
+dd_plot$order <- factor(dd_plot$variable, levels = vars)
+dd_plot <- dd_plot[order(dd_plot$order),]
+
+
+dd_plot_list <- split(dd_plot, dd_plot$order)
+
+dd_plot_list <- lapply(1:length(dd_plot_list), function(i){
+  df <- dd_plot_list[[i]]
+  df <- df %>%
+    ggplot(aes(day, response, col=treat2, group=ID))+
+    geom_line()+
+    facet_wrap(~treat) +
+    labs(x="Time (days)", subtitle = label[unique(df$variable)], y="Density\n(cells/ml)",
+    		 col="Temperature", tag = tag[i]) +
+    theme_bw() +
+    standard_theme() +
+    scale_color_brewer(palette = "Dark2")+
+    theme(legend.position = "none",
+          panel.spacing =  unit(0, "lines"),
+          strip.text.x = element_blank(),
+    			plot.subtitle = ggtext::element_markdown()) +
+    guides(col=guide_legend(ncol=2))
+
+  if(i %in% c(2,4,6,8,10,12)){
+    df <- df + theme(axis.title = element_blank(), axis.text.x = element_blank(), axis.ticks.x=element_blank())
+  }
+  if(i == 14){
+    df <- df + theme(axis.title.y = element_blank(),
+                     legend.position = "bottom")
+  }
+  if(i %in% c(1,3,5,7,9,11)){
+    df <- df + theme(axis.title.x = element_blank(), axis.text.x = element_blank(), axis.ticks.x=element_blank())
+  }
+  df
+})
+
+plot_original_leg <- get_legend(dd_plot_list[[14]])
+dd_plot_list[[14]] <- dd_plot_list[[14]] + theme(legend.position = "none")
+
+(Reduce("+", dd_plot_list) + plot_layout(ncol = 2))/(plot_original_leg) + plot_layout(heights = c(11,1))
+```
+
+## Multiview EDM related figures
+
+### Figure for choosing k
+
+```{r choose_k_plot, fig.width=11, fig.height=6, out.width="95%", cache=TRUE, warning=FALSE, message=FALSE}
+load(here("Data/Multiview_forecast_data/dd_choose_k.Rdata"))
+
+rmsemax <- dd_choose_k %>%
+  group_by(target,ID) %>%
+  summarize(min=min(rmse), k = k[which.min(rmse)])
+rmsemaxvalue <- max(dd_choose_k$rmse)
+
+choose_k_list <- split(dd_choose_k, dd_choose_k$target)
+
+choose_k_list <- lapply(1:length(choose_k_list), function(i){
+  df <- choose_k_list[[i]]
+  df <-
+  	df %>%
+  	dplyr::filter(abs(perc_change)<6)%>%
+  	ggplot(aes(k,perc_change,col=ID))+
+  	geom_hline(yintercept = 1, col="black", linetype=2)+
+  	geom_hline(yintercept = 0, col="black", linetype=2)+
+  	geom_vline(xintercept = 100, col="black", linetype=2) +
+  	geom_line(na.rm = T)+
+    labs(subtitle = label[unique(df$target)], y="Forecast skill\npercentage change", x="k-value",
+    		 col="Bottle", tag = tag[i]) +
+    theme_bw() +
+    standard_theme() +
+    scale_color_brewer(palette = "Dark2")+
+    theme(legend.position = "none",
+          panel.spacing =  unit(0, "lines"),
+          strip.text.x = element_blank(),
+    			plot.subtitle = ggtext::element_markdown())
+  if(i==1){
+  	df <- df + theme(axis.title.x = element_blank(), axis.text.x = element_blank(), axis.ticks.x=element_blank(),
+  									 legend.position = "bottom") + guides(col=guide_legend(ncol=6))
+  }
+  if(i %in% c(2,3,4)){
+  	df <- df + theme(axis.title = element_blank(), axis.text.x = element_blank(), axis.ticks.x=element_blank())
+  }
+  if(i %in% c(6,7,8)){
+  	df <- df + theme(axis.title.y = element_blank())
+  }
+  df
+  })
+
+plot_kplot_leg <- get_legend(choose_k_list[[1]])
+choose_k_list[[1]] <- choose_k_list[[1]] + theme(legend.position = "none")
+
+(Reduce("+", choose_k_list) + plot_layout(ncol = 4))/(plot_kplot_leg) + plot_layout(heights = c(11,1))
+```
+
+### The number of multiview models fitted (main text)
+
+```{r model.tab, cache=TRUE}
+model.table <- data.frame(number_of_predictors=c(1,2,3,4,6,8,10,13))
+model.table$choose_n_from_13 <- choose(13,model.table$number_of_predictors)
+model.table$number_of_predictor_combos <- ifelse(model.table$choose_n_from_13>200,200,model.table$choose_n_from_13)
+model.table$number_of_lagged_predictors_for_n_predictors <- choose(3*model.table$number_of_predictors,3)
+model.table$number_of_different_k_values <- sapply(model.table$number_of_lagged_predictors_for_n_predictors,
+                                                   function(x){sum(ks<=x)})
+model.table$number_of_predictor_combos_TIMES_number_of_different_k_values <-
+  model.table$number_of_predictor_combos*model.table$number_of_different_k_values
+number_of_models <- sum(model.table$number_of_predictor_combos_TIMES_number_of_different_k_values)*8*18
+
+colnames(model.table) <- c("Nr. of\npredictors $n$","Nr. of combinations\n$\\binom{13}{n}$",
+																"Used nr. of\ncombinations","Nr. of different\nembeddings $m=\\binom{n l}{E}$",
+																"Nr. of used\n embedings ($k$)","Nr. of\nmodels")
+kable(model.table,
+			booktabs = T, escape = F,
+			col.names = linebreak(colnames(model.table)),
+			label="model", align = "c", caption = "Table listing the number of predictors and the respective number of different combinations, the number of used combinations, the number of different possible embeddings, the number of used embeddings and the number of fitted models. The last column (number of fitted models for a given number of predictors) is calculated by multiplying the number of used predictor combinations with the number of used embeddings ($k$). The total number of fitted models is calculated by summing the last column and multiplying the result by 8 (number of targets), 18 (number or bottles) and 2 (the prediction is repetead with temperature included as a predictor) and then adding 1 (the model with only temperature as a predictor). See the main text for more information.")  %>%
+	# column_spec(1:6, width = "2.4cm") %>%
+  kable_styling(font_size = 8)
+```
+
+
+### Forecast skill maxima vs number of predictors
+
+```{r num_pred_vs_min_rmse, fig.width=13, fig.height=6, out.width="95%", cache=TRUE, message=FALSE}
+ddrq1_summarized %>%
+  ggplot(aes(num_pred, min_rmse,
+             group=interaction(ID,interaction),
+             col=interaction))+
+  geom_point(na.rm = T, size=0.8)+
+  geom_line(size=0.5, alpha=0.35)+
+  standard_theme2()+
+  theme(legend.position = "bottom", strip.text = ggtext::element_markdown())+
+  scale_color_manual(values = cbbPalette, aesthetics = c("col","fill"),
+                    labels = c("Constant & Not a predictor","Constant & Predictor",
+                    					 "Fluctuating & Not a predictor","Fluctuating & Predictor")) +
+  facet_wrap(~Target2, ncol = 4) +
+  labs(y="Lowest achieved RMSE",x="Number of predictors used", col="Temperature") +
+  guides(col=guide_legend(nrow=2,byrow=TRUE))
+```
+
+
+### Forecast skill across bottles
+
+```{r bottle_id_plot, fig.width=12, fig.height=10, out.width="95%", cache=TRUE, message=FALSE}
+Reduce("+", ranef.plot.list) + bottle.mean.plot + plot_annotation(tag_levels = 'A') 
+```
+
+## Number of interactions per target per bottle
+
+```{r number_of_int_spec, fig.width=12, fig.height=4, out.width="95%"}
+num_int_plot
+```
+
+## Distribution of pairwise mean interaction strengths
+
+```{r is_distr, cache=TRUE, message=FALSE, warning=FALSE, fig.width=10, fig.height=8, out.width="95%"}
+dd_mean_is %>%
+	ggplot(aes(abs(mean)))+
+	geom_histogram(bins = 15)+
+	standard_theme2()+
+	labs(x="Absolute values of pairwise mean interaction strengths", y="Count")+
+	facet_wrap(~ID, ncol = 4)
+```
+
+
+## Post-hoc test to investigate the effect of temperature fluctuations on forecast skill
+
+```{r, fig.height=6, fig.width=10, cache=TRUE}
+m.mv2.emm <- emmeans(m.mv2, c("treat"), by="Target")
+contrasts.tab <- as.data.frame(pairs(m.mv2.emm))
+contrasts.tab$contrast <- "Constant - Fluctuating"
+contrasts.tab$Target <- c("Bacteria","\\textit{C. reinhardtii}",
+                      "\\textit{C. striatum}", "\\textit{D. campylum}",
+                      "\\textit{E. gracilis}", "\\textit{E. daidaleos}", 
+                      "\\textit{P. caudatum}", "\\textit{Rotifer} sp.")
+
+facet.labs <- c("Bacteria","*Chlamydomonas reinhardtii*","*Colpidium striatum*",
+                "*Dexiostoma campylum*", "*Euglena gracilis*", "*Euplotes daidaleos*",
+                "*Paramecium caudatum*", "*Rotifer* sp.")
+names(facet.labs) <- c("bacteria","chlamydomonas_reinhardtii","colpidium_striatum",
+                       "dexiostomata_campylum","euglena_gracilis","euplotes_daidaleos",
+                       "paramecium_caudatum","rotifer_sp")
+
+contrast.plot <- plot(m.mv2.emm, comparisons = TRUE)
+contrast.plot +
+  standard_theme() +
+  labs(x="Mean RMSE", y="Temperature") +
+  scale_y_discrete(breaks=c("treat","const"), labels=c("Fluctuating","Constant"))+
+  facet_wrap(~Target, ncol = 2, labeller = labeller(Target = facet.labs)) +
+  theme(strip.text = ggtext::element_markdown())
+```
+
+```{r contrast_tab, cache=TRUE}
+contrasts.tab$p.value <- ifelse(contrasts.tab$p.value<0.001, "<0.001",
+														 sprintf("%.3f", round(contrasts.tab$p.value,3)))
+options(knitr.kable.NA = '-')
+rownames(contrasts.tab) <- NULL 
+contrasts.tab %>%
+	mutate_all(linebreak, align="l") %>%
+	kable(booktabs = T, digits = 3,
+				col.names = c("Constant", "Target", "Estimate" ,"Std. Err.", "DF", "\\textit{t}-value", "\\textit{p}-value"),
+				caption = "contrast table. caption to be done",
+				align = c("llllrrlrr"), escape = F,
+				label = "contrasts") %>%
+	kable_styling(font_size = 7)
+```
+
+
+## Predictor importance: further analyses
+
+```{r pred_imp_plot_13, fig.width=13, fig.height=9, out.width="95%", cache=TRUE, message=FALSE, warning=FALSE}
+dd_forecast13_list <- split(dd_forecast13, dd_forecast13$Target)
+
+dd_forecast13_list <- lapply(1:length(dd_forecast13_list), function(i){
+	df <- dd_forecast13_list[[i]]
+	plot <- df %>%
+		ggplot(aes(log10.mean.abs, shape=treat, RMSE_dif))+
+		geom_point(aes(fill=interactor),size=2, col="black")+ 
+		facet_wrap(~treat, ncol = 4) +
+		labs(subtitle = unique(df$Target), tag=tag[i], x=expression('log'[10]~"(Mean interaction strength)")) +
+		scale_shape_manual(values=c(21,23))+
+		scale_color_manual(breaks = levels(ddrq1_importance$interactor),
+											 values = palette2, aesthetics = c("fill","color"))+
+		standard_theme() +
+		theme(legend.position = "none",
+					panel.spacing =  unit(0, "lines"),
+					axis.title = element_blank(),
+					strip.text.x = element_blank(),
+					legend.text = ggtext::element_markdown(),
+					plot.subtitle = ggtext::element_markdown()) +
+    guides(col=guide_legend(ncol=2))
+
+	plot
+})
+
+m.pred.imp.plot.leg <- dd_forecast13 %>%
+	ggplot(aes(log10.mean.abs,RMSE_dif,shape=treat))+
+	geom_point(aes(col=interactor,fill=interactor),size=2,)+
+	facet_wrap(~treat, ncol = 4) +
+	scale_color_manual(breaks = levels(dd_forecast13$interactor),
+										 values = palette2, aesthetics = c("fill","color"))+
+	standard_theme() +
+	scale_shape_manual(values=c(21,23))+
+	theme(legend.position = "right",
+				panel.spacing =  unit(0, "lines"),
+				strip.text.x = element_blank(),
+				legend.text = ggtext::element_markdown(size = 11),
+				plot.subtitle = ggtext::element_markdown()) +
+	labs(shape="Temperature", fill= "Interactor/Predictor", col="Interactor/Predictor") +
+	guides(col=guide_legend(ncol=2))
+
+m.pred.imp.plot.leg <- get_legend(m.pred.imp.plot.leg)
+
+ylab <- ggplot(data.frame(l = "    Predictor importance", x = 1, y = 1)) +
+	geom_text(aes(x, y, label = l), angle = 90, size=6) +
+	theme_void() +
+	coord_cartesian(clip = "off")
+
+xlab <- ggplot(data.frame(x = 1, y = 1)) +
+	geom_text(aes(x, y), label = expression('log'[10]~"(Mean interaction strength)"), size=6) +
+	theme_void() +
+	coord_cartesian(clip = "off")
+
+plot4_13 <- ((ylab + ((Reduce("+", dd_forecast13_list) + plot_layout(ncol = 2)) / xlab + plot_layout(heights = c(50,1))) + m.pred.imp.plot.leg + plot_layout(widths = c(2,80,20))))
+plot4_13
+```
+
+
+### Predictor importance for targets Euglena and Chlamydomonas
+
+```{r tab.eug.chlam.importance, fig.width=13, fig.height=4, out.width="95%", cache=TRUE, message=FALSE}
+predimport.eug.chla.tab$p.value <- ifelse(predimport.eug.chla.tab$p.value<0.001, "<0.001",
+																 sprintf("%.3f", round(predimport.eug.chla.tab$p.value,3)))
+options(knitr.kable.NA = '-')
+predimport.eug.chla.tab %>%
+	mutate_all(linebreak, align="l") %>%
+	kable(booktabs = T, digits = 3,
+				col.names = c("Target", "Covariate" ,"Type", "Coefficient", "Std. Err.", "Test", "Value", "\\textit{p}-value"),
+				caption = "Caption to be added.",
+				align = c("lllrrlrr"), escape = F,
+				label = "rq1tab") %>%
+	collapse_rows(columns = 1, latex_hline ='custom', custom_latex_hline = 1,
+								valign = "middle")%>%
+	kable_styling(font_size = 7,latex_options = "hold_position")
+```
+
+
+### CCM vs mean interaction strength
+
+```{r ccm.int.strength.plot, fig.width=13, fig.height=9, echo=FALSE, out.width="95%", cache=TRUE, message=FALSE, warning=FALSE}
+ccm.int.strength.plot 
+```
+
+
+
+## Species interactions robustness analyses
+
+### Sensitivity analysis for the parameter $\theta$
+
+```{r mean_int_rmse_plot_thetas, fig.width=13, fig.height=4, out.width="95%", cache=TRUE, message=FALSE}
+thetaplot1 + thetaplot2 + thetaplot3
+```
+
+```{r rq1tab_sens, cache=TRUE}
+tab.rq1.theta3$theta <- "$\\theta=3$"
+tab.rq1.theta7$theta <- "$\\theta=7$"
+tab.rq1.theta <- rbind(tab.rq1.theta3,tab.rq1.theta7)
+tab.rq1.theta$p.value <- ifelse(tab.rq1.theta$p.value<0.001, "<0.001",
+																sprintf("%.3f", round(tab.rq1.theta$p.value,3)))
+options(knitr.kable.NA = '-')
+tab.rq1.theta %>%
+	mutate_all(linebreak, align="l") %>%
+	kable(booktabs = T, digits = 3,
+				col.names = c("Theta", "Response", "Covariate" ,"Type", "Coefficient", "Std. Err.", "Test", "Value", "\\textit{p}-value"),
+				caption = "The same as Table \\ref{tab:rq1tab}, but for the analysis redone with the parameter $\\theta$ respectively set to 3 and 7, instead of 5 (i.e. the sensitivity analysis).",
+				align = c("llllrrlrr"), escape = F,
+				label = "rq1tab.sens") %>%
+	collapse_rows(columns = 1:2, latex_hline ='custom', custom_latex_hline = 1:2,
+								valign = "middle")%>%
+	kable_styling(font_size = 7)
+```
+
+### Using Regularized S-map
+
+```{r regsmap_figure, fig.width=13, fig.height=6, out.width="95%", cache=TRUE, message=FALSE}
+plotregsmap <- ((plotregsmap1 + plotregsmap2 + plot_layout(ncol = 1)) | plot_leg_regsmap ) +
+  plot_layout(widths = c(3,1))
+plotregsmap
+```
+
+```{r regsmap_tab, cache=TRUE}
+tab.rq1.ELNET0.9 <- cbind(Regularization="ELNET0.9",tab.rq1.ELNET0.9)
+tab.rq1.ridge <- cbind(Regularization="Ridge Regr.",tab.rq1.ridge)
+tab.rq1.tikhonov <- cbind(Regularization="Tikhonov",tab.rq1.tikhonov)
+tab.rq1.regsmap <- rbind(tab.rq1.ELNET0.9,tab.rq1.ridge,tab.rq1.tikhonov)
+tab.rq1.regsmap <- tab.rq1.regsmap[c(6:15,26:35,46:55),]
+
+tab.rq1.regsmap$p.value <- ifelse(tab.rq1.regsmap$p.value<0.001, "<0.001",
+														 sprintf("%.3f", round(tab.rq1.regsmap$p.value,3)))
+options(knitr.kable.NA = '-')
+rownames(tab.rq1.regsmap) <- NULL 
+tab.rq1.regsmap %>%
+	mutate_all(linebreak, align="l") %>%
+	kable(booktabs = T, digits = 3,
+				col.names = c("Regularization", "Response", "Covariate" ,"Type", "Coefficient", "Std. Err.", "Test", "Value", "\\textit{p}-value"),
+				caption = "to be done",
+				align = c("llllrrlrr"), escape = F,
+				label = "robust") %>%
+	collapse_rows(columns = 1:2, latex_hline ='custom', custom_latex_hline = 1:2,
+								valign = "middle")%>%
+	kable_styling(font_size = 7)
+```
+
+
+
+## General robustness figures
+
+### Robustness plot 1
+
+```{r mean_int_rmse_plot_robustness, fig.width=13, fig.height=6, out.width="95%", cache=TRUE, message=FALSE}
+plot.robust1 + plot.robust2 + plot.robust3 + plot.robust.leg
+```
+
+```{r robust_tab, cache=TRUE}
+tab.robust$p.value <- ifelse(tab.robust$p.value<0.001, "<0.001",
+														 sprintf("%.3f", round(tab.robust$p.value,3)))
+options(knitr.kable.NA = '-')
+rownames(tab.robust) <- NULL 
+tab.robust %>%
+	mutate_all(linebreak, align="l") %>%
+	kable(booktabs = T, digits = 3,
+				col.names = c("Robustness model", "Response", "Covariate" ,"Type", "Coefficient", "Std. Err.", "Test", "Value", "\\textit{p}-value"),
+				caption = "Similar to Table \\ref{tab:rq1tab} (i.e., showing the results of the mixed effects model), but for the different robust analyses (see the corresponding sections for more information).",
+				align = c("llllrrlrr"), escape = F,
+				label = "robust") %>%
+	collapse_rows(columns = 1:2, latex_hline ='custom', custom_latex_hline = 1:2,
+								valign = "middle")%>%
+	kable_styling(font_size = 7)
+```
+
+### The effect of variation in the recorded data
+
+```{r mean_int_rmse_cv, fig.width=13, fig.height=4, out.width="95%", cache=TRUE, message=FALSE}
+plot1aCV + plot1bCV + plot1cCV 
+```
+
+### The effects of different measurement methods
+
+```{r meas_method_plot1, fig.width=13, fig.height=6, out.width="95%", cache=TRUE, message=FALSE}
+(boxplot1+boxplot2)/(boxplot3+boxplot_legend)
+```
+
+```{r meas_method_plot2, fig.width=13, fig.height=4, out.width="95%", cache=TRUE, message=FALSE}
+meas.plot1+meas.plot2+meas.plot3
+```
+
+## Forecasting robustness analyses
+
+### Sensitivity analysis for E
+
+```{r fig1_allEs, fig.width=13, fig.height=6.5, out.width="95%", cache=TRUE, message=FALSE}
+plot1_allEs
+```
+
+```{r e.sens.tab, cache=TRUE}
+tab.rq1.allEs <- rbind(tab.rq1.E2[1:10,],tab.rq1.E4[1:10,])
+tab.rq1.allEs$p.value <- ifelse(tab.rq1.allEs$p.value<0.001, "<0.001",
+														 sprintf("%.3f", round(tab.rq1.allEs$p.value,3)))
+options(knitr.kable.NA = '-')
+rownames(tab.rq1.allEs) <- NULL 
+tab.rq1.allEs %>%
+	mutate_all(linebreak, align="l") %>%
+	kable(booktabs = T, digits = 3,
+				col.names = c("E", "Response", "Covariate" ,"Type", "Coefficient", "Std. Err.", "Test", "Value", "\\textit{p}-value"),
+				caption = "caption to be done",
+				align = c("llllrrlrr"), escape = F,
+				label = "robust") %>%
+	collapse_rows(columns = 1:2, latex_hline ='custom', custom_latex_hline = 1:2,
+								valign = "middle")%>%
+	kable_styling(font_size = 7)
+```
+
+
+```{r num_pred_distr_allEs, fig.width=14, fig.height=7.5, out.width="95%", cache=TRUE, message=FALSE}
+mvForecast_best_allEs %>%
+	ggplot(aes(count,num_pred, group=treat)) +
+	geom_point(aes(fill=Target),size=2.5,col="black", alpha=0.5, shape=21)+
+	scale_fill_brewer(palette = "Dark2")+
+	facet_grid(E_char~Treat) + 
+	standard_theme() +
+	labs(x=expression("Number of interactions"~italic(N[T])), y="Number of predictors\nin best model",
+			 tag="A")+
+	theme(legend.position = "none", legend.box="vertical",
+				axis.title = element_text(size=12),
+				axis.text = element_text(size=11),
+				strip.text = element_text(size=12, hjust = 0, vjust = 1.8, 
+																	margin = margin(t = 2, r = 2, b = 0, l = 0, unit = "pt"))) +
+
+mvForecast_best_allEs %>%
+	ggplot(aes(num_pred, fill=Target)) +
+	geom_bar() +
+	scale_fill_brewer(palette = "Dark2")+
+	standard_theme()+
+	facet_grid(E_char~Treat) + 
+	scale_x_continuous(breaks = seq(1,13,by = 2)) +
+	labs(x="Number of predictors in best model", y="Count", tag="B")+
+	theme(legend.position = "right", 
+				legend.text = ggtext::element_markdown(size = 11),
+				legend.title = element_text(size=12),
+				axis.title = element_text(size=12),
+				axis.text = element_text(size=11),
+				strip.text = element_text(size=12, hjust = 0, vjust = 1.8, 
+																	margin = margin(t = 2, r = 2, b = 0, l = 0, unit = "pt")))
+```
+
+
+### EDM forecasting robustness analyses
+
+```{r forecast_robust_plot, fig.width=13, fig.height=6, out.width="95%", cache=TRUE, message=FALSE, warning=FALSE}
+(forecast_boxplot + forecast_corr)/(plot.simplexbest1 + plot.simplexbest2 + plot.simplexbest.leg)
+```
+
+```{r forecast_rob_tab, cache=TRUE}
+tab.model <- tab.model[c(6:15,21:30),]
+tab.model$p.value <- ifelse(tab.model$p.value<0.001, "<0.001",
+														 sprintf("%.3f", round(tab.model$p.value,3)))
+options(knitr.kable.NA = '-')
+rownames(tab.model) <- NULL 
+tab.model %>%
+	mutate_all(linebreak, align="l") %>%
+	kable(booktabs = T, digits = 3,
+				col.names = c("Forecast model", "Response", "Covariate" ,"Type", "Coefficient", "Std. Err.", "Test", "Value", "\\textit{p}-value"),
+				caption = "Similar to Table \\ref{tab:rq1tab} (i.e., showing the results of the mixed effects model), but for the different EDM forecast models used (see the corresponding sections for more information).",
+				align = c("llllrrlrr"), escape = F,
+				label = "robust") %>%
+	collapse_rows(columns = 1:2, latex_hline ='custom', custom_latex_hline = 1:2,
+								valign = "middle")%>%
+	kable_styling(font_size = 7)
+```
+
+
+## The analysis redone with different estimation methodologies
+
+### Forecasting using other methods
+
+```{r forecast_ARIMA_RNN, fig.width=13, fig.height=6, out.width="95%", cache=TRUE, message=FALSE, warning=FALSE}
+(forecast_boxplot2 + forecast_corr2)/(plot.ARIMARNN1 + plot.ARIMARNN2 + plot.ARIMARNN.leg)
+```
+
+```{r forecast_arima_rnn_tab, cache=TRUE}
+tab.model2 <- tab.model2[c(6:15,21:30),-2]
+tab.model2$p.value <- ifelse(tab.model2$p.value<0.001, "<0.001",
+														 sprintf("%.3f", round(tab.model2$p.value,3)))
+options(knitr.kable.NA = '-')
+rownames(tab.model2) <- NULL 
+tab.model2 %>%
+	mutate_all(linebreak, align="l") %>%
+	kable(booktabs = T, digits = 3,
+				col.names = c("Forecast model", "Response", "Covariate" ,"Type", "Coefficient", "Std. Err.", "Test", "Value", "\\textit{p}-value"),
+				caption = "Similar to Table \\ref{tab:rq1tab} (i.e., showing the results of the mixed effects model), but for the different forecast models used, i.e. ARIMA and RNN (see the corresponding sections for more information).",
+				align = c("llllrrlrr"), escape = F,
+				label = "arimarnn") %>%
+	collapse_rows(columns = 1:2, latex_hline ='custom', custom_latex_hline = 1:2,
+								valign = "middle")%>%
+	kable_styling(font_size = 7)
+```
+
+### permutation entropy and MARSS estimates
+
+```{r marss_and_pe_plot, fig.width=13, fig.height=6, out.width="95%", cache=TRUE, message=FALSE}
+(plot1aPE + plot1bPE + plot1cPE) / (marsplot1 + marsplot2) 
+```
+
+
