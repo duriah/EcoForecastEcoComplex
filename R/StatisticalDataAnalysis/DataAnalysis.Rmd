@@ -737,7 +737,7 @@ mv.tab.anova <- data.frame(Covariate = c("\\textbf{A: Temperature is predictor}"
 													 Estimate = anova(m.mv2)[,1],
 													 DF= paste(anova(m.mv2)[,3],round(anova(m.mv2)[,4],1), sep = ", "),
 													 Std.err = NA,
-													 Test = "$\\chi^2$",
+													 Test = "\\textit{F}",
 													 Test.value = anova(m.mv2)[,5],
 													 p.value = anova(m.mv2)[,6])
 
@@ -989,7 +989,7 @@ mv.interactopredictor.anova <- data.frame(Covariate = c("\\textbf{A: log10(mean 
 																					Estimate = anova(m.pred.imp)[,1],
 																					DF= paste(anova(m.pred.imp)[,3],round(anova(m.pred.imp)[,4],1), sep = ", "),
 																					Std.err = NA,
-																					Test = "$\\chi^2$",
+																					Test = "\\textit{F}",
 																					Test.value = anova(m.pred.imp)[,5],
 																					p.value = anova(m.pred.imp)[,6])
 
