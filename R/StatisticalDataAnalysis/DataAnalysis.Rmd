@@ -212,7 +212,6 @@ dd2 <- dd2 %>%
 rm(time.interp)
 ```
 
-
 # Estimations and forecastings (main text)
 
 ## Species abudance forecasting
@@ -417,7 +416,7 @@ rm(list_smap, pairwise_ccm_df_list)
 
 rq1_model_fcts <- function(ddrq1_treat_14, iso=T, corr=T, count=T, mean_mean_abs=T, table=T){
 
-	newdat <- F
+	newdat <- NULL
 	if(iso){
 		m.iso <- lmer(RMSE~sum_mean_abs*treat + (1|ID), data = ddrq1_treat_14)
 		newdat.iso <- expand.grid(sum_mean_abs = seq(min(ddrq1_treat_14$sum_mean_abs),
@@ -431,7 +430,7 @@ rq1_model_fcts <- function(ddrq1_treat_14, iso=T, corr=T, count=T, mean_mean_abs
 														 upper.iso=newdat.iso$RMSE+cmult*sqrt(pvar1.iso))
 		newdat.iso$model <- "iso"
 		
-		if(newdat==F){
+		if(is.null(newdat)){
 			newdat <- newdat.iso
 		} else {
 			newdat <- full_join(newdat,newdat.iso)
@@ -450,7 +449,7 @@ rq1_model_fcts <- function(ddrq1_treat_14, iso=T, corr=T, count=T, mean_mean_abs
 															 lower.count=newdat.count$RMSE-cmult*sqrt(pvar1.count),
 															 upper.count=newdat.count$RMSE+cmult*sqrt(pvar1.count))
 		newdat.count$model <- "count"
-		if(newdat==F){
+		if(is.null(newdat)){
 			newdat <- newdat.count
 		} else {
 			newdat <- full_join(newdat,newdat.count)
@@ -469,7 +468,7 @@ rq1_model_fcts <- function(ddrq1_treat_14, iso=T, corr=T, count=T, mean_mean_abs
 																			 lower.mean_mean_abs=newdat.mean_mean_abs$RMSE-cmult*sqrt(pvar1.mean_mean_abs),
 																			 upper.mean_mean_abs=newdat.mean_mean_abs$RMSE+cmult*sqrt(pvar1.mean_mean_abs))
 		newdat.mean_mean_abs$model <- "mean_mean_abs" 
-		if(newdat==F){
+		if(is.null(newdat)){
 			newdat <- newdat.mean_mean_abs
 		} else {
 			newdat <- full_join(newdat,newdat.mean_mean_abs)
@@ -491,7 +490,7 @@ rq1_model_fcts <- function(ddrq1_treat_14, iso=T, corr=T, count=T, mean_mean_abs
 															lower.corr=newdat.corr$mean_mean_abs-cmult*sqrt(pvar1.corr),
 															upper.corr=newdat.corr$mean_mean_abs+cmult*sqrt(pvar1.corr))
 		newdat.corr$model <-  "corr"
-		if(newdat==F){
+		if(is.null(newdat)){
 			newdat <- newdat.corr
 		} else {
 			newdat <- full_join(newdat,newdat.corr)
@@ -587,7 +586,32 @@ ddrq1_treat_14_theta5$theta = 5
 tab.rq1.theta5 <- cbind(theta=5,tab.rq1.theta5)
 ```
 
-
+```{r, fig.width=5, fig.height=3.5}
+# dd_mean <- dd %>%
+#   group_by(ID, variable) %>%
+#   summarise(mean_abundance = mean(response),
+#             abundance_unit = unique(unit)) %>%
+#   dplyr::filter(variable %in% targets) %>%
+#   rename(Target=variable)
+# 
+# tab <- full_join(dd_mean, ddrq1_treat_14) %>%
+#   rename(bottle=ID) %>%
+#   dplyr::select(bottle,Target,mean_abundance,abundance_unit,
+#                 treat,treat3,RMSE,mean_mean_abs,median_mean_abs,mean_abs_mean) %>%
+#   rename(Temperature = treat, TemperatureMoreDetailed = treat3) %>%
+#   mutate(Temperature = ifelse(Temperature=="const","Constant","Fluctuating"))
+# 
+# # tab %>%
+# #   ggplot(aes(log10(mean_abundance),mean_mean_abs, col=Target))+
+# #   geom_point()+
+# #   facet_wrap(~bottle, scales = "free")
+# 
+# tab %>%
+#   ggplot(aes(log10(mean_abundance),mean_mean_abs, col=Target))+
+#   geom_point()
+# 
+# write_csv(tab,"tab.csv")
+```
 
 ## Forecast error vs. increasing number of predictors 
 
