@@ -343,7 +343,7 @@ pairwise_ccm_df_list <- mclapply(dd2_dflist, function(df){
 		
 		rho_surr <- data.frame(interactor_rho = numeric(1000))
 		
-		interactor_data = as.data.frame(cbind(df$day, ts, surr_interactor))
+		interactor_data = as.data.frame(cbind(df$day, unlist(df[,as.character(r[1])]), surr_interactor))
 		names(interactor_data) = c("day", r[1], paste("T", as.character(seq(1, 1000)),	sep = ""))
 		
 		for (i in 1:1000) {
